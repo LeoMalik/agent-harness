@@ -267,3 +267,37 @@ def test_cancel_flag_and_idempotent_write(tmp_path, monkeypatch):
 
     request_cancel(store, "turn_demo")
     assert is_cancelled(store, "turn_demo")
+
+
+def test_cancel_keeps_flag_and_records_history(tmp_path, monkeypatch):
+    store = MemoryStore()
+    db = FakeDB()
+    runtime = make_runtime(tmp_path, [ModelResponse(text="done")], monkeypatch, db=db)
+    runtime.store = store
+    runtime.run("hi")
+    turn = runtime.history.load_turn(runtime.session.session_id)
+    runtime.cancel(turn.turn_id)
+    # 取消标记仍在（cancel 是 B 侧请求，不 cleanup 删除它）
+    assert is_cancelled(store, turn.turn_id)
+    # History 里记录了 cancelled
+    statuses = [e for e in runtime.history.events(runtime.session.session_id) if e.type == "turn_status"]
+    assert any(e.payload.get("status") == TurnStatus.CANCELLED.value for e in statuses)
+
+
+def test_before_tool_checkpoint_blocks_tools_when_cancelled(tmp_path, monkeypatch):
+    db = FakeDB()
+    runtime = make_runtime(tmp_path, [], monkeypatch, db=db)
+    turn = runtime.start_turn("write two files")
+    runtime.cancelled = True
+    result = runtime._handle_tools(
+        turn,
+        [
+            ToolCall("c1", "write_file", {"path": "a.md", "content": "1"}),
+            ToolCall("c2", "write_file", {"path": "b.md", "content": "2"}),
+        ],
+    )
+    assert result is not None
+    assert result.status == TurnStatus.CANCELLED.value
+    # before_tool 检查点拦住了所有 tool，没有写入任何文件
+    assert "agent-files/local/files/a.md" not in db.files
+    assert "agent-files/local/files/b.md" not in db.files

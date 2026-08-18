@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlparse
 
 from harness.config import Config
 from harness.runtime import Runtime
-from harness.store import connect_store, events_key, request_cancel
+from harness.store import connect_store, events_key
 
 
 def _json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
@@ -105,7 +105,6 @@ class handler(BaseHTTPRequestHandler):
             if turn is None:
                 _json(self, 404, {"error": "no_turn"})
                 return
-            request_cancel(runtime.store, turn.turn_id)
             runtime.cancel(turn.turn_id)
             latest = runtime.history.load_turn(session_id) or turn
             _json(self, 200, _turn_payload(runtime, latest))

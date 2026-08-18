@@ -165,12 +165,27 @@ class Runtime:
         return self._loop(turn)
 
     def cancel(self, turn_id: str | None = None) -> None:
+        """请求取消（外部/B 侧）：只写共享 Redis 标记 + History 状态，不清理、不 finish。
+
+        真正的收尾由正在跑 loop 的实例在下一个检查点读标记后 `_finish(CANCELLED)` 完成。
+        若这里直接 `_finish`，其 `cleanup_turn` 会删掉取消标记，导致 loop 实例读不到、取消失效。
+        """
         self.cancelled = True
-        if turn_id:
-            request_cancel(self.store, turn_id)
-            turn = self.history.load_turn(self.session.session_id)
-            if turn and turn.turn_id == turn_id:
-                self._finish(turn, TurnStatus.CANCELLED)
+        turn = self.history.load_turn(self.session.session_id)
+        if turn_id is None:
+            turn_id = turn.turn_id if turn else None
+        if not turn_id:
+            return
+        request_cancel(self.store, turn_id)
+        self.history.emit(
+            "turn_status",
+            session_id=turn.session_id if turn else self.session.session_id,
+            turn_id=turn_id,
+            agent_id=turn.agent_id if turn else self.session.agent_id,
+            status=TurnStatus.CANCELLED.value,
+            error=None,
+        )
+        publish_event(self.store, turn_id, "turn.cancelled", {})
 
     def _stop_if_cancelled(self, turn: Turn) -> Turn | None:
         if self.cancelled or is_cancelled(self.store, turn.turn_id):
@@ -215,6 +230,9 @@ class Runtime:
     def _handle_tools(self, turn: Turn, calls: list[ToolCall]) -> Turn | None:
         wait_ids: list[str] = []
         for call in calls:
+            # before_tool 检查点：执行每个 Tool 前读一次取消标记
+            if stopped := self._stop_if_cancelled(turn):
+                return stopped
             self.history.emit(
                 "tool_call",
                 session_id=turn.session_id,
