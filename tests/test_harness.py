@@ -32,10 +32,11 @@ class FakeLLM:
 
 
 class FakeDB:
-    """In-memory stand-in for harness.db.Supabase (select/insert/upsert/patch/ping)."""
+    """In-memory stand-in for harness.db.Supabase (tables + storage)."""
 
     def __init__(self):
         self.tables: dict[str, list[dict]] = {}
+        self.files: dict[str, str] = {}  # "bucket/path" -> content
 
     def _rows(self, table: str) -> list[dict]:
         return self.tables.setdefault(table, [])
@@ -76,6 +77,19 @@ class FakeDB:
     def patch(self, table: str, params: dict, row: dict) -> list[dict]:
         return [dict(row)]
 
+    def storage_put(self, bucket: str, path: str, content: str) -> None:
+        self.files[f"{bucket}/{path}"] = content
+
+    def storage_get(self, bucket: str, path: str) -> str:
+        key = f"{bucket}/{path}"
+        if key not in self.files:
+            raise RuntimeError(f"not found: {path}")
+        return self.files[key]
+
+    def storage_list(self, bucket: str, prefix: str = "") -> list[str]:
+        prefix_full = f"{bucket}/{prefix}"
+        return [k.split("/", 1)[1] for k in self.files if k.startswith(prefix_full)]
+
     def ping(self) -> bool:
         return True
 
@@ -93,12 +107,13 @@ def make_config(tmp_path: Path) -> Config:
     return config
 
 
-def make_runtime(tmp_path: Path, responses: list, monkeypatch: pytest.MonkeyPatch) -> Runtime:
-    db = FakeDB()
+def make_runtime(tmp_path: Path, responses: list, monkeypatch: pytest.MonkeyPatch, db: FakeDB | None = None) -> Runtime:
+    db = db or FakeDB()
     config = make_config(tmp_path)
     monkeypatch.setattr(Config, "db", lambda self: db)
     runtime = Runtime.create(config, cwd=tmp_path, store=MemoryStore())
     runtime.llm = FakeLLM(responses)
+    runtime.db = db  # type: ignore[attr-defined]
     return runtime
 
 
@@ -111,7 +126,8 @@ def test_direct_answer(tmp_path, monkeypatch):
 
 
 def test_read_file_tool(tmp_path, monkeypatch):
-    (tmp_path / "note.txt").write_text("alpha", encoding="utf-8")
+    db = FakeDB()
+    db.storage_put("agent-files", "note.txt", "alpha")
     runtime = make_runtime(
         tmp_path,
         [
@@ -119,6 +135,7 @@ def test_read_file_tool(tmp_path, monkeypatch):
             ModelResponse(text="the file says alpha"),
         ],
         monkeypatch,
+        db=db,
     )
     turn = runtime.run("read note")
     assert turn.status == TurnStatus.COMPLETED.value
@@ -176,10 +193,13 @@ def test_context_uses_checkpoint(tmp_path, monkeypatch):
     assert any(text and "new" in text for text in texts)
 
 
-def test_write_file_tool(tmp_path):
-    tools = default_tools(Config(root=tmp_path), tmp_path)
+def test_write_file_tool(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    tools = default_tools(config, tmp_path)
     tools["write_file"].run(path="out.md", content="hi")
-    assert (tmp_path / "out.md").read_text(encoding="utf-8") == "hi"
+    assert db.files["agent-files/out.md"] == "hi"
 
 
 def test_spawn_child(tmp_path, monkeypatch):
@@ -204,6 +224,7 @@ def test_spawn_child(tmp_path, monkeypatch):
 
 def test_cancel_flag_and_idempotent_write(tmp_path, monkeypatch):
     store = MemoryStore()
+    db = FakeDB()
     runtime = make_runtime(
         tmp_path,
         [
@@ -212,11 +233,12 @@ def test_cancel_flag_and_idempotent_write(tmp_path, monkeypatch):
             ModelResponse(text="wrote"),
         ],
         monkeypatch,
+        db=db,
     )
     runtime.store = store
     turn = runtime.run("write")
     assert turn.status == TurnStatus.COMPLETED.value
-    assert (tmp_path / "out.md").read_text(encoding="utf-8") == "once"
+    assert db.files["agent-files/out.md"] == "once"
     events = [event for event in runtime.history.events(runtime.session.session_id) if event.type == "observation"]
     summaries = [event.payload.get("summary", "") for event in events]
     assert len(summaries) == 2

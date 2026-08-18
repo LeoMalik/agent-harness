@@ -26,6 +26,7 @@ class Config:
     redis_url: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
     supabase_url: str = os.getenv("SUPABASE_URL", "")
     supabase_service_role_key: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    storage_bucket: str = os.getenv("HARNESS_STORAGE_BUCKET", "agent-files")
     handshake_token: str = os.getenv("HARNESS_HANDSHAKE_TOKEN", "harness-ok")
     max_steps: int = 16
     max_agent_depth: int = 2

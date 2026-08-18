@@ -35,19 +35,24 @@ def default_tools(config: Config, cwd: Path) -> dict[str, Tool]:
     cwd = cwd.resolve()
 
     def read_file(path: str, **_: Any) -> Observation:
-        target = _resolve(cwd, path)
-        text = target.read_text(encoding="utf-8")
-        return _maybe_artifact(config, "read_file", text, refs=[str(target)])
+        db = config.db()
+        if db is None:
+            raise RuntimeError("Supabase is required for file storage")
+        key = _storage_path(path)
+        text = db.storage_get(config.storage_bucket, key)
+        return _maybe_artifact(config, "read_file", text, refs=[f"supabase://storage/{config.storage_bucket}/{key}"])
 
     def write_file(path: str, content: str, **_: Any) -> Observation:
-        target = _resolve(cwd, path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        db = config.db()
+        if db is None:
+            raise RuntimeError("Supabase is required for file storage")
+        key = _storage_path(path)
+        db.storage_put(config.storage_bucket, key, content)
         return Observation(
             tool_call_id="",
             tool_name="write_file",
-            summary=f"Wrote {len(content)} chars to {target}",
-            refs=[str(target)],
+            summary=f"Wrote {len(content)} chars to {key}",
+            refs=[f"supabase://storage/{config.storage_bucket}/{key}"],
         )
 
     def bash(command: str, **_: Any) -> Observation:
@@ -119,13 +124,13 @@ def default_tools(config: Config, cwd: Path) -> dict[str, Tool]:
     tools = [
         Tool(
             "read_file",
-            "Read a UTF-8 text file.",
+            "Read a UTF-8 text file from persistent storage (Supabase Storage).",
             _object({"path": _string("Path to read")}),
             read_file,
         ),
         Tool(
             "write_file",
-            "Write a UTF-8 text file. Ask before overwriting important files.",
+            "Write a UTF-8 text file to persistent storage (Supabase Storage).",
             _object({"path": _string("Path to write"), "content": _string("File content")}),
             write_file,
             needs_approval=True,
@@ -213,11 +218,9 @@ def _maybe_artifact(config: Config, tool_name: str, text: str, refs: list[str]) 
     )
 
 
-def _resolve(cwd: Path, path: str) -> Path:
-    target = Path(path)
-    if not target.is_absolute():
-        target = cwd / target
-    return target.resolve()
+def _storage_path(path: str) -> str:
+    parts = [seg for seg in path.strip().replace("\\", "/").split("/") if seg and seg not in (".", "..")]
+    return "/".join(parts)
 
 
 def _string(description: str) -> dict[str, Any]:
