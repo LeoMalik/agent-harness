@@ -12,6 +12,7 @@ class History:
     def __init__(self, config: Config):
         self.config = config
         config.ensure_dirs()
+        self.db = config.db()
 
     def session_dir(self, session_id: str) -> Path:
         path = self.config.data_dir / "sessions" / session_id
@@ -22,12 +23,36 @@ class History:
         return self.session_dir(session_id) / "events.jsonl"
 
     def append(self, event: Event) -> Event:
+        if self.db:
+            self.db.insert(
+                "events",
+                {
+                    "event_id": event.event_id,
+                    "type": event.type,
+                    "session_id": event.session_id,
+                    "turn_id": event.turn_id,
+                    "agent_id": event.agent_id,
+                    "created_at": event.created_at,
+                    "payload": event.payload,
+                },
+            )
+            return event
         path = self.events_path(event.session_id)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
         return event
 
     def events(self, session_id: str) -> list[Event]:
+        if self.db:
+            rows = self.db.select(
+                "events",
+                {
+                    "select": "*",
+                    "session_id": f"eq.{session_id}",
+                    "order": "created_at.asc",
+                },
+            )
+            return [Event.from_dict(row) for row in rows]
         path = self.events_path(session_id)
         if not path.exists():
             return []
@@ -38,20 +63,41 @@ class History:
         return items
 
     def save_session(self, session: Session) -> None:
+        if self.db:
+            self.db.upsert("sessions", session.to_dict(), "session_id")
+            return
         path = self.session_dir(session.session_id) / "session.json"
         path.write_text(json.dumps(session.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load_session(self, session_id: str) -> Session | None:
+        if self.db:
+            rows = self.db.select("sessions", {"select": "*", "session_id": f"eq.{session_id}", "limit": "1"})
+            return Session.from_dict(rows[0]) if rows else None
         path = self.session_dir(session_id) / "session.json"
         if not path.exists():
             return None
         return Session.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def save_turn(self, turn: Turn) -> None:
+        row = turn.to_dict()
+        if self.db:
+            self.db.upsert("turns", row, "turn_id")
+            return
         path = self.session_dir(turn.session_id) / "turn.json"
-        path.write_text(json.dumps(turn.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load_turn(self, session_id: str) -> Turn | None:
+        if self.db:
+            rows = self.db.select(
+                "turns",
+                {
+                    "select": "*",
+                    "session_id": f"eq.{session_id}",
+                    "order": "updated_at.desc",
+                    "limit": "1",
+                },
+            )
+            return Turn.from_dict(rows[0]) if rows else None
         path = self.session_dir(session_id) / "turn.json"
         if not path.exists():
             return None

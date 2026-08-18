@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from enum import Enum
@@ -102,7 +103,11 @@ class Turn:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Turn:
-        return _from_dict(cls, data)
+        payload = dict(data)
+        wait_ids = payload.get("wait_ids")
+        if isinstance(wait_ids, str):
+            payload["wait_ids"] = json.loads(wait_ids)
+        return _from_dict(cls, payload)
 
 
 @dataclass

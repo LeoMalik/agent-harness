@@ -194,16 +194,26 @@ def _maybe_artifact(config: Config, tool_name: str, text: str, refs: list[str]) 
     if len(text) <= config.max_inline_chars:
         return Observation(tool_call_id="", tool_name=tool_name, summary=text, refs=refs)
     artifact_id = new_id("art")
-    path = config.data_dir / "artifacts" / f"{artifact_id}.txt"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    preview = text[:500]
+    db = config.db()
+    if db:
+        db.insert(
+            "artifacts",
+            {"artifact_id": artifact_id, "content": text, "preview": preview},
+        )
+        location = f"supabase://artifacts/{artifact_id}"
+    else:
+        path = config.data_dir / "artifacts" / f"{artifact_id}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        location = str(path)
     return Observation(
         tool_call_id="",
         tool_name=tool_name,
-        summary=f"Output stored as artifact {artifact_id} ({len(text)} chars). Read the artifact file if more is needed.",
-        refs=refs + [str(path)],
+        summary=f"Output stored as artifact {artifact_id} ({len(text)} chars). Read {location} if more is needed.",
+        refs=refs + [location],
         artifact_id=artifact_id,
-        preview=text[:500],
+        preview=preview,
     )
 
 

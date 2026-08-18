@@ -4,8 +4,8 @@ A small Python harness from the Agent Learning Notes:
 
 - Turn states: `running` / `pending` / `completed` / `cancelled` / `failed`
 - Tools: `read_file`, `write_file`, `bash`, `search_web`, `remember`, `ask_user`, `spawn`
-- JSONL history, resume, memory reminders, skill catalog, saved graph templates
-- Redis via `REDIS_URL`: cancel flag, turn event stream, write idempotency. Local first; change the URL for cloud.
+- JSONL history locally, or Supabase when `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set
+- Redis via `REDIS_URL`: cancel flag, turn event stream, write idempotency
 
 ## Setup
 
@@ -27,5 +27,7 @@ uv run harness resume --session ses_xxx "France"
 uv run harness cancel --session ses_xxx
 ```
 
-Sessions are stored under `data/sessions/`. Memory is keyed by `user_id` + `workspace_id`.
-Redis defaults to `redis://127.0.0.1:6379/0`. If Redis is down, the runtime falls back to an in-process store.
+Without Supabase credentials, sessions stay under `data/sessions/`.
+With Supabase, history, memory, and artifacts go to Postgres.
+
+HTTP handshake after Vercel deploy: `GET /` or `GET /handshake`.
