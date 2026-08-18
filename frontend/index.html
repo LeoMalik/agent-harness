@@ -39,6 +39,7 @@
     const sendBtn = document.getElementById("send");
 
     let sessionId = null;   // 复用同一会话，保持上下文
+    let thinkEl = null;     // 当前累积的思考块
 
     const esc = (s) => String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
@@ -51,20 +52,29 @@
       return d;
     }
 
+    function appendThinking(text) {
+      if (!thinkEl) thinkEl = add("proc", "💭 ");
+      thinkEl.appendChild(document.createTextNode(text));
+      chat.scrollTop = chat.scrollHeight;
+    }
+
     function renderEvent(ev) {
       const p = ev.payload || {};
       switch (ev.type) {
         case "turn.started": return add("proc", "▶ 开始执行");
+        case "thinking": return add("proc", "💭 " + esc(p.text || ""));
+        case "tool.started": return add("proc", "🔧 调用 <b>" + esc(p.name || "tool") + "</b>…");
         case "tool.completed": {
           const name = p.tool_name || "tool";
           const summary = p.summary || "";
-          const tag = p.outcome === "fail" ? "❌" : "🔧";
-          return add("proc", tag + " <b>" + esc(name) + "</b><br>" + esc(summary));
+          const mark = p.outcome === "fail" ? "❌" : "✅";
+          return add("proc", mark + " <b>" + esc(name) + "</b><br>" + esc(summary));
         }
-        case "turn.completed": return add("proc", "✅ 完成");
+        case "ask_user": return add("proc", "❓ 等待回答：" + esc(p.question || ""));
+        case "turn.completed": return add("proc", "🏁 完成");
         case "turn.failed": return add("proc", "❌ 失败" + (p.error ? "：" + esc(p.error) : ""));
         case "turn.cancelled": return add("proc", "⛔ 已取消");
-        default: return add("proc", esc(ev.type));
+        default: return; // 忽略 assistant.delta 等
       }
     }
 
@@ -76,7 +86,12 @@
         for (const ev of d.events || []) {
           if (seen.has(ev.id)) continue;
           seen.add(ev.id);
-          renderEvent(ev);
+          if (ev.type === "thinking.delta") {
+            appendThinking(ev.payload?.text || "");
+          } else {
+            thinkEl = null;   // 结束当前思考块
+            renderEvent(ev);
+          }
         }
       } catch (_) { /* ignore transient poll errors */ }
     }
@@ -102,9 +117,11 @@
         const data = await r.json();
         clearInterval(timer);
         await pollEvents(seen);                 // 拉齐最后一批事件
+        thinkEl = null;
         add("result", "<b>结果</b>（" + esc(data.status) + "）\n" + esc(data.final_text || "(无文本)"));
       } catch (err) {
         clearInterval(timer);
+        thinkEl = null;
         add("error", "错误：" + esc(err.message));
       } finally {
         sendBtn.disabled = false;
