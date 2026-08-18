@@ -42,7 +42,7 @@ def _turn_payload(runtime: Runtime, turn) -> dict:
 class handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path.rstrip("/") or "/"
-        if path in {"/", "/api", "/api/handshake"}:
+        if path in {"/", "/api", "/api/handshake", "/handshake"}:
             config = Config()
             checks = {
                 "ok": True,
