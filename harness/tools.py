@@ -196,17 +196,13 @@ def _maybe_artifact(config: Config, tool_name: str, text: str, refs: list[str]) 
     artifact_id = new_id("art")
     preview = text[:500]
     db = config.db()
-    if db:
-        db.insert(
-            "artifacts",
-            {"artifact_id": artifact_id, "content": text, "preview": preview},
-        )
-        location = f"supabase://artifacts/{artifact_id}"
-    else:
-        path = config.data_dir / "artifacts" / f"{artifact_id}.txt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-        location = str(path)
+    if db is None:
+        raise RuntimeError("Supabase is required for artifact storage")
+    db.insert(
+        "artifacts",
+        {"artifact_id": artifact_id, "content": text, "preview": preview},
+    )
+    location = f"supabase://artifacts/{artifact_id}"
     return Observation(
         tool_call_id="",
         tool_name=tool_name,

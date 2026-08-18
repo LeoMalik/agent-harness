@@ -13,7 +13,6 @@ load_dotenv(ROOT / ".env")
 @dataclass(frozen=True)
 class Config:
     root: Path = ROOT
-    data_dir: Path = ROOT / "data"
     prompts_dir: Path = ROOT / "prompts"
     skills_dir: Path = ROOT / "skills"
     graphs_dir: Path = ROOT / "graphs"
@@ -40,7 +39,3 @@ class Config:
         from harness.db import Supabase
 
         return Supabase(self.supabase_url, self.supabase_service_role_key)
-
-    def ensure_dirs(self) -> None:
-        for path in (self.data_dir / "sessions", self.data_dir / "artifacts", self.data_dir / "memory"):
-            path.mkdir(parents=True, exist_ok=True)

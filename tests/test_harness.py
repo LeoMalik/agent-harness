@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from harness.config import Config
 from harness.context import ContextBuilder, USER_TAG
 from harness.history import History
@@ -13,9 +15,9 @@ from harness.types import Event, ModelResponse, ToolCall, TurnStatus
 
 
 class FakeLLM:
-    def __init__(self, responses: list[ModelResponse]):
+    def __init__(self, responses):
         self.responses = list(responses)
-        self.calls: list[list[dict]] = []
+        self.calls = []
 
     def complete(self, messages, tools=None, temperature=0.2):
         self.calls.append(messages)
@@ -24,34 +26,94 @@ class FakeLLM:
         return self.responses.pop(0)
 
 
-def make_runtime(tmp_path: Path, responses: list[ModelResponse]) -> Runtime:
-    config = Config(root=tmp_path, data_dir=tmp_path / "data", prompts_dir=tmp_path / "prompts", skills_dir=tmp_path / "skills", graphs_dir=tmp_path / "graphs")
+class FakeDB:
+    """In-memory stand-in for harness.db.Supabase (select/insert/upsert/patch/ping)."""
+
+    def __init__(self):
+        self.tables: dict[str, list[dict]] = {}
+
+    def _rows(self, table: str) -> list[dict]:
+        return self.tables.setdefault(table, [])
+
+    def select(self, table: str, params: dict) -> list[dict]:
+        result = [dict(row) for row in self._rows(table)]
+        for key, value in params.items():
+            if key in ("select", "order", "limit", "offset"):
+                continue
+            if isinstance(value, str) and value.startswith("eq."):
+                wanted = value[3:]
+                result = [row for row in result if str(row.get(key)) == wanted]
+        order = params.get("order")
+        if order:
+            column = order.split(".")[0]
+            reverse = order.endswith(".desc")
+            result.sort(key=lambda row: str(row.get(column, "")), reverse=reverse)
+        limit = params.get("limit")
+        if limit:
+            result = result[: int(limit)]
+        return result
+
+    def insert(self, table: str, row: dict) -> list[dict]:
+        copied = dict(row)
+        self._rows(table).append(copied)
+        return [copied]
+
+    def upsert(self, table: str, row: dict, on_conflict: str) -> list[dict]:
+        rows = self._rows(table)
+        key = row.get(on_conflict)
+        for index, existing in enumerate(rows):
+            if existing.get(on_conflict) == key:
+                rows[index] = dict(row)
+                return [dict(row)]
+        rows.append(dict(row))
+        return [dict(row)]
+
+    def patch(self, table: str, params: dict, row: dict) -> list[dict]:
+        return [dict(row)]
+
+    def ping(self) -> bool:
+        return True
+
+
+def make_config(tmp_path: Path) -> Config:
+    config = Config(
+        root=tmp_path,
+        prompts_dir=tmp_path / "prompts",
+        skills_dir=tmp_path / "skills",
+        graphs_dir=tmp_path / "graphs",
+    )
     (tmp_path / "prompts").mkdir(exist_ok=True)
     (tmp_path / "prompts" / "AGENTS.md").write_text("Follow the user.", encoding="utf-8")
     (tmp_path / "prompts" / "SOUL.md").write_text("Be brief.", encoding="utf-8")
+    return config
+
+
+def make_runtime(tmp_path: Path, responses: list, monkeypatch: pytest.MonkeyPatch) -> Runtime:
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
     runtime = Runtime.create(config, cwd=tmp_path, store=MemoryStore())
     runtime.llm = FakeLLM(responses)
     return runtime
 
 
-def test_direct_answer(tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path, [ModelResponse(text="hello")])
+def test_direct_answer(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path, [ModelResponse(text="hello")], monkeypatch)
     turn = runtime.run("hi")
     assert turn.status == TurnStatus.COMPLETED.value
     assert turn.final_text == "hello"
     assert runtime.history.load_session(runtime.session.session_id) is not None
 
 
-def test_read_file_tool(tmp_path: Path) -> None:
+def test_read_file_tool(tmp_path, monkeypatch):
     (tmp_path / "note.txt").write_text("alpha", encoding="utf-8")
     runtime = make_runtime(
         tmp_path,
         [
-            ModelResponse(
-                tool_calls=[ToolCall("c1", "read_file", {"path": "note.txt"})],
-            ),
+            ModelResponse(tool_calls=[ToolCall("c1", "read_file", {"path": "note.txt"})]),
             ModelResponse(text="the file says alpha"),
         ],
+        monkeypatch,
     )
     turn = runtime.run("read note")
     assert turn.status == TurnStatus.COMPLETED.value
@@ -60,13 +122,14 @@ def test_read_file_tool(tmp_path: Path) -> None:
     assert any(event.type == "observation" and event.payload["summary"] == "alpha" for event in events)
 
 
-def test_ask_user_pending_and_resume(tmp_path: Path) -> None:
+def test_ask_user_pending_and_resume(tmp_path, monkeypatch):
     runtime = make_runtime(
         tmp_path,
         [
             ModelResponse(tool_calls=[ToolCall("c-ask", "ask_user", {"question": "Country?"})]),
             ModelResponse(text="France it is"),
         ],
+        monkeypatch,
     )
     turn = runtime.run("pick a country")
     assert turn.status == TurnStatus.PENDING.value
@@ -76,13 +139,14 @@ def test_ask_user_pending_and_resume(tmp_path: Path) -> None:
     assert resumed.final_text == "France it is"
 
 
-def test_remember_writes_memory_and_reminder(tmp_path: Path) -> None:
+def test_remember_writes_memory_and_reminder(tmp_path, monkeypatch):
     runtime = make_runtime(
         tmp_path,
         [
             ModelResponse(tool_calls=[ToolCall("c-mem", "remember", {"slot": "work.city", "text": "Hangzhou"})]),
             ModelResponse(text="noted"),
         ],
+        monkeypatch,
     )
     runtime.run("I work in Hangzhou")
     records = runtime.memory.active()
@@ -91,10 +155,10 @@ def test_remember_writes_memory_and_reminder(tmp_path: Path) -> None:
     assert any(event.type == "reminder" for event in runtime.history.events(runtime.session.session_id))
 
 
-def test_context_uses_checkpoint(tmp_path: Path) -> None:
-    config = Config(root=tmp_path, data_dir=tmp_path / "data", prompts_dir=tmp_path / "prompts")
-    (tmp_path / "prompts").mkdir()
-    (tmp_path / "prompts" / "AGENTS.md").write_text("sys", encoding="utf-8")
+def test_context_uses_checkpoint(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
     history = History(config)
     history.append(Event(type="user_message", session_id="s1", payload={"text": "old"}))
     history.append(Event(type="summary_checkpoint", session_id="s1", payload={"summary": "keep this"}))
@@ -107,21 +171,22 @@ def test_context_uses_checkpoint(tmp_path: Path) -> None:
     assert any(text and "new" in text for text in texts)
 
 
-def test_write_file_tool(tmp_path: Path) -> None:
-    tools = default_tools(Config(data_dir=tmp_path / "data"), tmp_path)
+def test_write_file_tool(tmp_path):
+    tools = default_tools(Config(root=tmp_path), tmp_path)
     tools["write_file"].run(path="out.md", content="hi")
     assert (tmp_path / "out.md").read_text(encoding="utf-8") == "hi"
 
 
-def test_spawn_child(tmp_path: Path, monkeypatch) -> None:
+def test_spawn_child(tmp_path, monkeypatch):
     parent = make_runtime(
         tmp_path,
         [
             ModelResponse(tool_calls=[ToolCall("c-spawn", "spawn", {"template": "explore", "goal": "look around"})]),
             ModelResponse(text="child said found it"),
         ],
+        monkeypatch,
     )
-    child = make_runtime(tmp_path, [ModelResponse(text="found it")])
+    child = make_runtime(tmp_path, [ModelResponse(text="found it")], monkeypatch)
     monkeypatch.setattr(Runtime, "create", classmethod(lambda cls, *args, **kwargs: child))
     turn = parent.run("explore")
     assert turn.status == TurnStatus.COMPLETED.value
@@ -132,7 +197,7 @@ def test_spawn_child(tmp_path: Path, monkeypatch) -> None:
     assert obs.payload["child_agent_id"] == child.session.agent_id
 
 
-def test_cancel_flag_and_idempotent_write(tmp_path: Path) -> None:
+def test_cancel_flag_and_idempotent_write(tmp_path, monkeypatch):
     store = MemoryStore()
     runtime = make_runtime(
         tmp_path,
@@ -141,6 +206,7 @@ def test_cancel_flag_and_idempotent_write(tmp_path: Path) -> None:
             ModelResponse(tool_calls=[ToolCall("c2", "write_file", {"path": "out.md", "content": "once"})]),
             ModelResponse(text="wrote"),
         ],
+        monkeypatch,
     )
     runtime.store = store
     turn = runtime.run("write")

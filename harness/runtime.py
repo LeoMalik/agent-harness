@@ -72,7 +72,6 @@ class Runtime:
         store: Store | None = None,
     ) -> Runtime:
         config = config or Config()
-        config.ensure_dirs()
         cwd = (cwd or Path.cwd()).resolve()
         history = History(config)
         memory = Memory(config, user_id, workspace_id)
