@@ -65,8 +65,15 @@ class ContextBuilder:
         return messages
 
     def should_compact(self, session_id: str) -> bool:
+        events = self.history.events(session_id)
+        # 只统计最后一个 checkpoint 之后的事件（即真正会注入 LLM 的部分），
+        # 否则压缩后历史总量仍超限，会在每个 step 反复压缩，陷入死循环。
+        start = 0
+        for index, event in enumerate(events):
+            if event.type == "summary_checkpoint":
+                start = index
         total = 0
-        for event in self.history.events(session_id):
+        for event in events[start:]:
             total += len(json.dumps(event.payload, ensure_ascii=False))
         return total > self.config.compact_chars
 

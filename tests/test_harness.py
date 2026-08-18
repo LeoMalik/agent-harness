@@ -193,6 +193,27 @@ def test_context_uses_checkpoint(tmp_path, monkeypatch):
     assert any(text and "new" in text for text in texts)
 
 
+def test_should_compact_ignores_pre_checkpoint_events(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+
+    # checkpoint 之前有超大旧事件，checkpoint 之后只有少量新事件 → 不应再压缩
+    history = History(config)
+    history.append(Event(type="user_message", session_id="s1", payload={"text": "x" * (config.compact_chars + 1000)}))
+    history.append(Event(type="summary_checkpoint", session_id="s1", payload={"summary": "small"}))
+    history.append(Event(type="user_message", session_id="s1", payload={"text": "new"}))
+    builder = ContextBuilder(config, history, Memory(config, "u", "w"))
+    assert builder.should_compact("s1") is False
+
+    # checkpoint 之后的新事件又超限 → 需要再次压缩
+    history2 = History(config)
+    history2.append(Event(type="summary_checkpoint", session_id="s2", payload={"summary": "small"}))
+    history2.append(Event(type="user_message", session_id="s2", payload={"text": "y" * (config.compact_chars + 1000)}))
+    builder2 = ContextBuilder(config, history2, Memory(config, "u", "w"))
+    assert builder2.should_compact("s2") is True
+
+
 def test_write_file_tool(tmp_path, monkeypatch):
     db = FakeDB()
     config = make_config(tmp_path)
