@@ -419,7 +419,7 @@ class Runtime:
         try:
             summary = compact_llm.complete(messages, tools=None).text.strip()
         except Exception:  # noqa: BLE001
-            summary = "Compact failed; continue from recent events only."
+            return  # 静默跳过：不写误导性的 checkpoint
         self.context.compact(turn.session_id, turn.turn_id, turn.agent_id, summary)
 
     def _finish(self, turn: Turn, status: TurnStatus, error: str | None = None) -> Turn:

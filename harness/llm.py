@@ -18,20 +18,20 @@ class LLM:
         self.small = small
 
     @property
+    def _use_small(self) -> bool:
+        return self.small and bool(self.config.small_api_key)
+
+    @property
     def model(self) -> str:
-        return self.config.small_model if self.small else self.config.model
+        return self.config.small_model if self._use_small else self.config.model
 
     @property
     def base_url(self) -> str:
-        if self.small and self.config.small_base_url:
-            return self.config.small_base_url.rstrip("/")
-        return self.config.base_url.rstrip("/")
+        return self.config.small_base_url.rstrip("/") if self._use_small else self.config.base_url.rstrip("/")
 
     @property
     def api_key(self) -> str:
-        if self.small and self.config.small_api_key:
-            return self.config.small_api_key
-        return self.config.api_key
+        return self.config.small_api_key if self._use_small else self.config.api_key
 
     def complete(
         self,

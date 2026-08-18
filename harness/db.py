@@ -53,7 +53,11 @@ class Supabase:
         with httpx.Client(timeout=60) as client:
             response = client.post(
                 f"{self.url}/storage/v1/object/{bucket}/{path}",
-                headers={"apikey": self.headers["apikey"], "Authorization": self.headers["Authorization"]},
+                headers={
+                    "apikey": self.headers["apikey"],
+                    "Authorization": self.headers["Authorization"],
+                    "x-upsert": "true",
+                },
                 content=content.encode("utf-8"),
             )
             if response.status_code >= 400:
