@@ -110,13 +110,14 @@ class Runtime:
             items.append(spawn_schema())
         return items
 
-    def run(self, text: str) -> Turn:
+    def start_turn(self, text: str) -> Turn:
         turn = Turn(
             turn_id=new_id("turn"),
             session_id=self.session.session_id,
             agent_id=self.session.agent_id,
             user_text=text,
         )
+        self.history.save_turn(turn)
         self.history.emit(
             "user_message",
             session_id=turn.session_id,
@@ -124,6 +125,16 @@ class Runtime:
             agent_id=turn.agent_id,
             text=text,
         )
+        publish_event(self.store, turn.turn_id, "turn.started", {"session_id": turn.session_id, "text": text})
+        return turn
+
+    def run(self, text: str) -> Turn:
+        return self._loop(self.start_turn(text))
+
+    def continue_turn(self) -> Turn:
+        turn = self.history.load_turn(self.session.session_id)
+        if turn is None:
+            raise RuntimeError("No turn to continue")
         return self._loop(turn)
 
     def resume(self, session_id: str, answer: str) -> Turn:
@@ -166,16 +177,27 @@ class Runtime:
             return self._finish(turn, TurnStatus.CANCELLED)
         return None
 
+    def _on_llm_delta(self, turn: Turn, kind: str, text: str) -> None:
+        if not text:
+            return
+        event_type = "thinking.delta" if kind == "thinking" else "assistant.delta"
+        publish_event(self.store, turn.turn_id, event_type, {"text": text})
+
     def _loop(self, turn: Turn) -> Turn:
         self.history.save_turn(turn)
-        publish_event(self.store, turn.turn_id, "turn.started", {"session_id": turn.session_id})
         for _ in range(self.config.max_steps):
             if stopped := self._stop_if_cancelled(turn):
                 return stopped
             if self.context.should_compact(turn.session_id):
                 self._compact(turn)
             messages = self.context.messages(turn.session_id, self.extra_system)
-            response = self.llm.complete(messages, self.schemas())
+            response = self.llm.complete(
+                messages,
+                self.schemas(),
+                on_delta=lambda kind, text, current=turn: self._on_llm_delta(current, kind, text),
+            )
+            if response.thinking:
+                publish_event(self.store, turn.turn_id, "thinking", {"text": response.thinking})
             if response.tool_calls:
                 pending = self._handle_tools(turn, response.tool_calls)
                 if pending:
@@ -210,6 +232,12 @@ class Runtime:
                 turn.wait_ids = [call.tool_call_id]
                 turn.resume_token = new_id("tok")
                 self.history.save_turn(turn)
+                publish_event(
+                    self.store,
+                    turn.turn_id,
+                    "ask_user",
+                    {"question": (call.arguments or {}).get("question") or "", "tool_call_id": call.tool_call_id},
+                )
                 return turn
             if call.name == "spawn":
                 wait_ids.append(call.tool_call_id)
@@ -261,6 +289,12 @@ class Runtime:
             if cached is not None:
                 self._write_observation(turn, cached)
                 continue
+            publish_event(
+                self.store,
+                turn.turn_id,
+                "tool.started",
+                {"tool_call_id": call.tool_call_id, "name": call.name, "arguments": call.arguments},
+            )
             try:
                 observation = bind(tool.run(**call.arguments), call)
             except Exception as exc:  # noqa: BLE001 - tool errors become observations

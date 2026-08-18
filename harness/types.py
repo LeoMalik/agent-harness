@@ -152,5 +152,6 @@ class SemanticRecord:
 @dataclass
 class ModelResponse:
     text: str = ""
+    thinking: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: dict[str, int] = field(default_factory=dict)

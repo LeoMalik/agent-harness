@@ -50,7 +50,7 @@ class MemoryStore:
 
     def xrange(self, key: str, start: str = "-", end: str = "+", count: int | None = None) -> list[tuple[str, dict[str, str]]]:
         items = list(self.streams.get(key, []))
-        if start != "-":
+        if start not in {"-", ""}:
             items = [item for item in items if item[0] > start]
         if count is not None:
             items = items[:count]
@@ -130,6 +130,19 @@ def publish_event(store: Store, turn_id: str, event_type: str, payload: dict[str
         events_key(turn_id),
         {"type": event_type, "payload": json.dumps(payload, ensure_ascii=False)},
     )
+
+
+def read_events(store: Store, turn_id: str, after: str = "0-0") -> list[dict[str, Any]]:
+    start = "-" if after in {"", "0", "0-0", "-"} else after
+    items = []
+    for event_id, fields in store.xrange(events_key(turn_id), start=start):
+        raw = fields.get("payload") or "{}"
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = {"text": raw}
+        items.append({"id": event_id, "type": fields.get("type") or "", "payload": payload})
+    return items
 
 
 def cleanup_turn(store: Store, turn_id: str) -> None:

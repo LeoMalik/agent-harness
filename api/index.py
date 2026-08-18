@@ -3,17 +3,18 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from harness.config import Config
 from harness.runtime import Runtime
-from harness.store import request_cancel
+from harness.store import connect_store, events_key, request_cancel
 
 
 def _json(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
@@ -70,6 +71,9 @@ class handler(BaseHTTPRequestHandler):
                 checks["redis_error"] = str(exc)
             _json(self, 200 if checks["ok"] else 503, checks)
             return
+        if path == "/api/events":
+            self._events()
+            return
         _json(self, 404, {"error": "not_found"})
 
     def do_POST(self) -> None:
@@ -107,3 +111,35 @@ class handler(BaseHTTPRequestHandler):
             _json(self, 200, _turn_payload(runtime, latest))
             return
         _json(self, 404, {"error": "not_found"})
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def _events(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        turn_id = (query.get("turn_id") or [""])[0]
+        session_id = (query.get("session_id") or [""])[0]
+        if session_id and not turn_id:
+            from harness.history import History
+
+            turn = History(Config()).load_turn(session_id)
+            if turn:
+                turn_id = turn.turn_id
+        if not turn_id:
+            _json(self, 200, {"turn_id": None, "events": []})
+            return
+        store = connect_store(Config().redis_url)
+        events = []
+        for event_id, fields in store.xrange(events_key(turn_id)):
+            raw = fields.get("payload", "{}")
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                payload = {"raw": raw}
+            events.append({"id": event_id, "type": fields.get("type", ""), "payload": payload})
+        _json(self, 200, {"turn_id": turn_id, "events": events})

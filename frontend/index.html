@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Harness</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; max-width: 760px; margin: 0 auto; padding: 20px; }
+  h2 { margin: 0 0 12px; }
+  #chat { height: 68vh; overflow-y: auto; border: 1px solid #8884; border-radius: 10px; padding: 14px; margin-bottom: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .row { max-width: 88%; padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
+  .user { align-self: flex-end; background: #2563eb; color: #fff; }
+  .proc { align-self: flex-start; color: #888; font-size: 0.82em; padding: 3px 8px; border-left: 2px solid #8885; border-radius: 0; max-width: 94%; }
+  .result { align-self: flex-start; background: #f3f4f6; color: #111; }
+  .error { align-self: flex-start; color: #dc2626; }
+  form { display: flex; gap: 8px; }
+  input { flex: 1; padding: 11px; border: 1px solid #8884; border-radius: 10px; font-size: 1em; }
+  button { padding: 11px 18px; border: 0; border-radius: 10px; background: #2563eb; color: #fff; font-size: 1em; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+</style>
+</head>
+<body>
+  <h2>Agent Harness</h2>
+  <div id="chat"></div>
+  <form id="form">
+    <input id="input" placeholder="输入消息，回车发送…" autocomplete="off">
+    <button id="send" type="submit">发送</button>
+  </form>
+
+  <script>
+    // 后端地址：改成你的 agent-harness 部署域名
+    const API_BASE = "https://agent-harness-app.vercel.app";
+
+    const chat = document.getElementById("chat");
+    const form = document.getElementById("form");
+    const input = document.getElementById("input");
+    const sendBtn = document.getElementById("send");
+
+    let sessionId = null;   // 复用同一会话，保持上下文
+
+    const esc = (s) => String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+    function add(cls, html) {
+      const d = document.createElement("div");
+      d.className = "row " + cls;
+      d.innerHTML = html;
+      chat.appendChild(d);
+      chat.scrollTop = chat.scrollHeight;
+      return d;
+    }
+
+    function renderEvent(ev) {
+      const p = ev.payload || {};
+      switch (ev.type) {
+        case "turn.started": return add("proc", "▶ 开始执行");
+        case "tool.completed": {
+          const name = p.tool_name || "tool";
+          const summary = p.summary || "";
+          const tag = p.outcome === "fail" ? "❌" : "🔧";
+          return add("proc", tag + " <b>" + esc(name) + "</b><br>" + esc(summary));
+        }
+        case "turn.completed": return add("proc", "✅ 完成");
+        case "turn.failed": return add("proc", "❌ 失败" + (p.error ? "：" + esc(p.error) : ""));
+        case "turn.cancelled": return add("proc", "⛔ 已取消");
+        default: return add("proc", esc(ev.type));
+      }
+    }
+
+    async function pollEvents(seen) {
+      if (!sessionId) return;
+      try {
+        const r = await fetch(API_BASE + "/api/events?session_id=" + encodeURIComponent(sessionId));
+        const d = await r.json();
+        for (const ev of d.events || []) {
+          if (seen.has(ev.id)) continue;
+          seen.add(ev.id);
+          renderEvent(ev);
+        }
+      } catch (_) { /* ignore transient poll errors */ }
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text || sendBtn.disabled) return;
+      input.value = "";
+      add("user", esc(text));
+      sendBtn.disabled = true;
+
+      if (!sessionId) sessionId = "ses_" + Math.random().toString(36).slice(2, 10);
+      const seen = new Set();
+      const timer = setInterval(() => pollEvents(seen), 700);
+
+      try {
+        const r = await fetch(API_BASE + "/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, session_id: sessionId }),
+        });
+        const data = await r.json();
+        clearInterval(timer);
+        await pollEvents(seen);                 // 拉齐最后一批事件
+        add("result", "<b>结果</b>（" + esc(data.status) + "）\n" + esc(data.final_text || "(无文本)"));
+      } catch (err) {
+        clearInterval(timer);
+        add("error", "错误：" + esc(err.message));
+      } finally {
+        sendBtn.disabled = false;
+        input.focus();
+      }
+    });
+  </script>
+</body>
+</html>

@@ -19,11 +19,16 @@ class FakeLLM:
         self.responses = list(responses)
         self.calls = []
 
-    def complete(self, messages, tools=None, temperature=0.2):
+    def complete(self, messages, tools=None, temperature=0.2, on_delta=None):
         self.calls.append(messages)
         if not self.responses:
             return ModelResponse(text="empty")
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if on_delta and response.thinking:
+            on_delta("thinking", response.thinking)
+        if on_delta and response.text:
+            on_delta("assistant", response.text)
+        return response
 
 
 class FakeDB:
