@@ -19,6 +19,8 @@
   input { flex: 1; padding: 11px; border: 1px solid #8884; border-radius: 10px; font-size: 1em; }
   button { padding: 11px 18px; border: 0; border-radius: 10px; background: #2563eb; color: #fff; font-size: 1em; cursor: pointer; }
   button:disabled { opacity: 0.5; cursor: default; }
+  #stop { background: #dc2626; }
+  #stop:disabled { background: #888; opacity: 0.4; }
 </style>
 </head>
 <body>
@@ -27,6 +29,7 @@
   <form id="form">
     <input id="input" placeholder="输入消息，回车发送…" autocomplete="off">
     <button id="send" type="submit">发送</button>
+    <button id="stop" type="button" disabled>停止</button>
   </form>
 
   <script>
@@ -37,9 +40,12 @@
     const form = document.getElementById("form");
     const input = document.getElementById("input");
     const sendBtn = document.getElementById("send");
+    const stopBtn = document.getElementById("stop");
 
     let sessionId = null;   // 复用同一会话，保持上下文
     let thinkEl = null;     // 当前累积的思考块
+    let pollTimer = null;   // 当前轮询事件流的定时器
+    let running = false;    // 是否正在执行一个 turn
 
     const esc = (s) => String(s ?? "").replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
@@ -95,17 +101,34 @@
       } catch (_) { /* ignore transient poll errors */ }
     }
 
+    stopBtn.addEventListener("click", async () => {
+      if (!running || !sessionId) return;
+      stopBtn.disabled = true;
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      try {
+        await fetch(API_BASE + "/api/cancel", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        });
+      } catch (_) { /* 忽略取消请求本身的瞬时错误 */ }
+      thinkEl = null;
+      add("proc", "⛔ 已请求取消");
+    });
+
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const text = input.value.trim();
-      if (!text || sendBtn.disabled) return;
+      if (!text || running) return;
       input.value = "";
       add("user", esc(text));
+      running = true;
       sendBtn.disabled = true;
+      stopBtn.disabled = false;
 
       if (!sessionId) sessionId = "ses_" + Math.random().toString(36).slice(2, 10);
       const seen = new Set();
-      const timer = setInterval(() => pollEvents(seen), 700);
+      pollTimer = setInterval(() => pollEvents(seen), 700);
 
       try {
         const r = await fetch(API_BASE + "/api/chat", {
@@ -114,20 +137,22 @@
           body: JSON.stringify({ text, session_id: sessionId }),
         });
         const data = await r.json();
-        clearInterval(timer);
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         await pollEvents(seen);                 // 拉齐最后一批事件
         thinkEl = null;
         if (data.final_text) {
           add("result", esc(data.final_text));
-        } else if (data.status !== "completed") {
+        } else if (data.status !== "completed" && data.status !== "cancelled") {
           add("error", "状态：" + esc(data.status));
         }
       } catch (err) {
-        clearInterval(timer);
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         thinkEl = null;
         add("error", "错误：" + esc(err.message));
       } finally {
+        running = false;
         sendBtn.disabled = false;
+        stopBtn.disabled = true;
         input.focus();
       }
     });
