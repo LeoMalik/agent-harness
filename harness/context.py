@@ -114,23 +114,44 @@ class ContextBuilder:
         return None
 
     def _skill_catalog(self) -> str:
+        lines = []
+        # 出厂（built-in）skill：随代码分发，读本地部署包
         root = self.config.skills_dir
-        if not root.exists():
+        if root.exists():
+            for skill_md in sorted(root.glob("*/SKILL.md")):
+                first = next((line.strip("# ").strip() for line in skill_md.read_text(encoding="utf-8").splitlines() if line.strip()), skill_md.parent.name)
+                lines.append(f"- {skill_md.parent.name} (built-in): {first}")
+        # 用户（user）skill：云存储，按 user 隔离
+        db = self.config.db()
+        if db is not None:
+            try:
+                files = db.storage_list(self.config.storage_bucket, prefix=f"{self.memory.user_id}/skills/")
+                names = sorted({f.split("/")[2] for f in files if len(f.split("/")) > 2 and f.split("/")[2]})
+                for name in names:
+                    lines.append(f"- {name} (user): skills/{name}/SKILL.md")
+            except Exception:
+                pass
+        if not lines:
             return "No skills installed."
-        lines = [f"Skills live under `{root}`. Read SKILL.md first, then open only the chapter you need."]
-        for skill_md in sorted(root.glob("*/SKILL.md")):
-            first = next((line.strip("# ").strip() for line in skill_md.read_text(encoding="utf-8").splitlines() if line.strip()), skill_md.parent.name)
-            lines.append(f"- {skill_md.parent.name}: {first} ({skill_md})")
-        return "\n".join(lines)
+        return "Skills: read a skill's SKILL.md before using it.\n" + "\n".join(lines)
 
     def _graph_catalog(self) -> str:
+        lines = []
         root = self.config.graphs_dir
-        if not root.exists():
+        if root.exists():
+            for path in sorted(root.glob("*.md")):
+                lines.append(f"- {path.stem} (built-in)")
+        db = self.config.db()
+        if db is not None:
+            try:
+                files = db.storage_list(self.config.storage_bucket, prefix=f"{self.memory.user_id}/graphs/")
+                for f in sorted(files):
+                    lines.append(f"- {f} (user)")
+            except Exception:
+                pass
+        if not lines:
             return "No saved graphs."
-        lines = ["Saved graphs are templates. Spawn child agents for each node; do not invent a graph runtime."]
-        for path in sorted(root.glob("*.md")):
-            lines.append(f"- {path.stem}: {path}")
-        return "\n".join(lines)
+        return "Saved graphs are templates. Spawn child agents for each node; do not invent a graph runtime.\n" + "\n".join(lines)
 
 
 def _read(path: Path) -> str:

@@ -127,7 +127,7 @@ def test_direct_answer(tmp_path, monkeypatch):
 
 def test_read_file_tool(tmp_path, monkeypatch):
     db = FakeDB()
-    db.storage_put("agent-files", "note.txt", "alpha")
+    db.storage_put("agent-files", "local/files/note.txt", "alpha")
     runtime = make_runtime(
         tmp_path,
         [
@@ -199,7 +199,7 @@ def test_write_file_tool(tmp_path, monkeypatch):
     monkeypatch.setattr(Config, "db", lambda self: db)
     tools = default_tools(config, tmp_path)
     tools["write_file"].run(path="out.md", content="hi")
-    assert db.files["agent-files/out.md"] == "hi"
+    assert db.files["agent-files/local/files/out.md"] == "hi"
 
 
 def test_spawn_child(tmp_path, monkeypatch):
@@ -238,7 +238,7 @@ def test_cancel_flag_and_idempotent_write(tmp_path, monkeypatch):
     runtime.store = store
     turn = runtime.run("write")
     assert turn.status == TurnStatus.COMPLETED.value
-    assert db.files["agent-files/out.md"] == "once"
+    assert db.files["agent-files/local/files/out.md"] == "once"
     events = [event for event in runtime.history.events(runtime.session.session_id) if event.type == "observation"]
     summaries = [event.payload.get("summary", "") for event in events]
     assert len(summaries) == 2

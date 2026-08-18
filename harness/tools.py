@@ -31,14 +31,14 @@ class Tool:
         }
 
 
-def default_tools(config: Config, cwd: Path) -> dict[str, Tool]:
+def default_tools(config: Config, cwd: Path, user_id: str = "local") -> dict[str, Tool]:
     cwd = cwd.resolve()
 
     def read_file(path: str, **_: Any) -> Observation:
         db = config.db()
         if db is None:
             raise RuntimeError("Supabase is required for file storage")
-        key = _storage_path(path)
+        key = _object_path(user_id, path)
         text = db.storage_get(config.storage_bucket, key)
         return _maybe_artifact(config, "read_file", text, refs=[f"supabase://storage/{config.storage_bucket}/{key}"])
 
@@ -46,7 +46,7 @@ def default_tools(config: Config, cwd: Path) -> dict[str, Tool]:
         db = config.db()
         if db is None:
             raise RuntimeError("Supabase is required for file storage")
-        key = _storage_path(path)
+        key = _object_path(user_id, path)
         db.storage_put(config.storage_bucket, key, content)
         return Observation(
             tool_call_id="",
@@ -221,6 +221,15 @@ def _maybe_artifact(config: Config, tool_name: str, text: str, refs: list[str]) 
 def _storage_path(path: str) -> str:
     parts = [seg for seg in path.strip().replace("\\", "/").split("/") if seg and seg not in (".", "..")]
     return "/".join(parts)
+
+
+def _object_path(user_id: str, path: str) -> str:
+    p = _storage_path(path)
+    if p.startswith("skills/"):
+        return f"{user_id}/skills/{p[len('skills/'):]}"
+    if p.startswith("graphs/"):
+        return f"{user_id}/graphs/{p[len('graphs/'):]}"
+    return f"{user_id}/files/{p}"
 
 
 def _string(description: str) -> dict[str, Any]:

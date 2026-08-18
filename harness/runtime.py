@@ -96,7 +96,7 @@ class Runtime:
             context=ContextBuilder(config, history, memory),
             cwd=cwd,
             session=session,
-            tools=default_tools(config, cwd),
+            tools=default_tools(config, cwd, session.user_id),
             store=store,
             depth=depth,
             extra_system=extra_system,
