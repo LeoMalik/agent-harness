@@ -196,8 +196,6 @@ class Runtime:
                 self.schemas(),
                 on_delta=lambda kind, text, current=turn: self._on_llm_delta(current, kind, text),
             )
-            if response.thinking:
-                publish_event(self.store, turn.turn_id, "thinking", {"text": response.thinking})
             if response.tool_calls:
                 pending = self._handle_tools(turn, response.tool_calls)
                 if pending:
