@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
 
 from harness.config import Config
+from harness.hooks import Hook, approval_hook, idempotency_hooks, interrupt_hook
 from harness.types import Observation, ToolCall, new_id
 
 
@@ -19,6 +20,8 @@ class Tool:
     parameters: dict[str, Any]
     run: Callable[..., Observation]
     needs_approval: bool = False
+    before_hooks: list[Hook] = field(default_factory=list)
+    after_hooks: list[Hook] = field(default_factory=list)
 
     def schema(self) -> dict[str, Any]:
         return {
@@ -113,7 +116,15 @@ def default_tools(config: Config, cwd: Path, user_id: str = "local") -> dict[str
             preview=json.dumps({"slot": slot, "text": text, "layer": layer}),
         )
 
-    def ask_user(question: str, options: list[str] | None = None, **_: Any) -> Observation:
+    def ask_user(question: str, options: list[str] | None = None, _human: dict[str, Any] | None = None, **_: Any) -> Observation:
+        answer = (_human or {}).get("answer")
+        if answer is not None and str(answer).strip() != "":
+            return Observation(
+                tool_call_id="",
+                tool_name="ask_user",
+                summary=str(answer),
+                preview=json.dumps({"question": question, "options": options or [], "answer": answer}),
+            )
         return Observation(
             tool_call_id="",
             tool_name="ask_user",
@@ -121,6 +132,37 @@ def default_tools(config: Config, cwd: Path, user_id: str = "local") -> dict[str
             preview=json.dumps({"question": question, "options": options or []}),
         )
 
+    def read_artifact_range(artifact_id: str, start_byte: int = 0, end_byte: int | None = None, **_: Any) -> Observation:
+        db = config.db()
+        if db is None:
+            raise RuntimeError("Supabase is required for artifact storage")
+        rows = db.select("artifacts", {"select": "*", "artifact_id": f"eq.{artifact_id}", "limit": "1"})
+        if not rows:
+            return Observation(
+                tool_call_id="",
+                tool_name="read_artifact_range",
+                outcome="fail",
+                summary=f"Artifact {artifact_id} not found",
+                error="not_found",
+            )
+        text = str(rows[0].get("content") or "")
+        start = max(0, int(start_byte or 0))
+        limit = config.artifact_range_bytes
+        end = min(len(text), int(end_byte) + 1 if end_byte is not None else start + limit)
+        if end - start > limit:
+            end = start + limit
+        chunk = text[start:end]
+        return Observation(
+            tool_call_id="",
+            tool_name="read_artifact_range",
+            summary=chunk,
+            refs=[f"supabase://artifacts/{artifact_id}"],
+            artifact_id=artifact_id,
+            preview=f"bytes {start}-{max(start, end - 1)} of {len(text)}",
+        )
+
+    write_before, write_after = idempotency_hooks()
+    bash_before, bash_after = idempotency_hooks()
     tools = [
         Tool(
             "read_file",
@@ -134,6 +176,8 @@ def default_tools(config: Config, cwd: Path, user_id: str = "local") -> dict[str
             _object({"path": _string("Path to write"), "content": _string("File content")}),
             write_file,
             needs_approval=True,
+            before_hooks=[approval_hook(), write_before],
+            after_hooks=[write_after],
         ),
         Tool(
             "bash",
@@ -141,6 +185,8 @@ def default_tools(config: Config, cwd: Path, user_id: str = "local") -> dict[str
             _object({"command": _string("Shell command")}),
             bash,
             needs_approval=True,
+            before_hooks=[approval_hook(), bash_before],
+            after_hooks=[bash_after],
         ),
         Tool(
             "search_web",
@@ -172,6 +218,20 @@ def default_tools(config: Config, cwd: Path, user_id: str = "local") -> dict[str
                 required=["question"],
             ),
             ask_user,
+            before_hooks=[interrupt_hook()],
+        ),
+        Tool(
+            "read_artifact_range",
+            "Read a byte range from a stored artifact. Use after a tool returns artifact_id.",
+            _object(
+                {
+                    "artifact_id": _string("Artifact id from a previous observation"),
+                    "start_byte": {"type": "integer", "description": "Inclusive start offset", "default": 0},
+                    "end_byte": {"type": "integer", "description": "Inclusive end offset; capped by Runtime"},
+                },
+                required=["artifact_id"],
+            ),
+            read_artifact_range,
         ),
     ]
     return {tool.name: tool for tool in tools}

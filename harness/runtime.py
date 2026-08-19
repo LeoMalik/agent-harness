@@ -1,14 +1,31 @@
 from __future__ import annotations
 
-import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from harness.config import Config
 from harness.context import ContextBuilder
+from harness.executor import ToolExecutor
 from harness.history import History
+from harness.hooks import (
+    AFTER_LLM_CALL,
+    AFTER_TOOL_CALL,
+    AFTER_TURN,
+    BEFORE_LLM_CALL,
+    BEFORE_TOOL,
+    PRE_COMPACT,
+    SESSION_START,
+    TURN_CLEANUP,
+    USER_PROMPT_SUBMIT,
+    HookBus,
+    HookContext,
+    HookResult,
+    default_hooks,
+    new_resume_token,
+    parse_resume_answer,
+)
 from harness.llm import LLM
 from harness.memory import Memory
 from harness.store import (
@@ -18,7 +35,6 @@ from harness.store import (
     is_cancelled,
     publish_event,
     request_cancel,
-    resources_key,
 )
 from harness.tools import Tool, bind, default_tools, spawn_schema
 from harness.types import (
@@ -50,10 +66,13 @@ class Runtime:
     session: Session
     tools: dict[str, Tool]
     store: Store
+    hooks: HookBus
+    executor: ToolExecutor
     cancelled: bool = False
     depth: int = 0
     extra_system: str = ""
     allowed_tools: set[str] | None = None
+    sub_agent_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def create(
@@ -70,15 +89,19 @@ class Runtime:
         extra_system: str = "",
         allowed_tools: set[str] | None = None,
         store: Store | None = None,
+        hooks: HookBus | None = None,
+        executor: ToolExecutor | None = None,
     ) -> Runtime:
         config = config or Config()
         cwd = (cwd or Path.cwd()).resolve()
         history = History(config)
         memory = Memory(config, user_id, workspace_id)
         store = store or connect_store(config.redis_url)
+        created = False
         if session_id and (existing := history.load_session(session_id)):
             session = existing
         else:
+            created = True
             session = Session(
                 session_id=session_id or new_id("ses"),
                 agent_id=new_id("agt"),
@@ -88,7 +111,7 @@ class Runtime:
                 parent_agent_id=parent_agent_id,
             )
             history.save_session(session)
-        return cls(
+        runtime = cls(
             config=config,
             history=history,
             memory=memory,
@@ -98,10 +121,18 @@ class Runtime:
             session=session,
             tools=default_tools(config, cwd, session.user_id),
             store=store,
+            hooks=hooks or default_hooks(config.hook_timeout_seconds),
+            executor=executor or ToolExecutor(),
             depth=depth,
             extra_system=extra_system,
             allowed_tools=allowed_tools,
         )
+        if created:
+            runtime.on_session_start()
+        return runtime
+
+    def publisher(self, turn_id: str, event_type: str, payload: dict[str, Any]) -> str:
+        return publish_event(self.store, turn_id, event_type, payload)
 
     def schemas(self) -> list[dict[str, Any]]:
         names = self.allowed_tools or set(self.tools)
@@ -109,24 +140,6 @@ class Runtime:
         if self.depth < self.config.max_agent_depth and (self.allowed_tools is None or "spawn" in self.allowed_tools):
             items.append(spawn_schema())
         return items
-
-    def start_turn(self, text: str) -> Turn:
-        turn = Turn(
-            turn_id=new_id("turn"),
-            session_id=self.session.session_id,
-            agent_id=self.session.agent_id,
-            user_text=text,
-        )
-        self.history.save_turn(turn)
-        self.history.emit(
-            "user_message",
-            session_id=turn.session_id,
-            turn_id=turn.turn_id,
-            agent_id=turn.agent_id,
-            text=text,
-        )
-        publish_event(self.store, turn.turn_id, "turn.started", {"session_id": turn.session_id, "text": text})
-        return turn
 
     def run(self, text: str) -> Turn:
         return self._loop(self.start_turn(text))
@@ -137,12 +150,41 @@ class Runtime:
             raise RuntimeError("No turn to continue")
         return self._loop(turn)
 
+    def on_session_start(self) -> None:
+        self.hooks.run_before(SESSION_START, self._hook_ctx(SESSION_START, None))
+
+    def start_turn(self, text: str) -> Turn:
+        turn = Turn(
+            turn_id=new_id("turn"),
+            session_id=self.session.session_id,
+            agent_id=self.session.agent_id,
+            user_text=text,
+        )
+        self.history.save_turn(turn)
+        result = self.hooks.run_before(USER_PROMPT_SUBMIT, self._hook_ctx(USER_PROMPT_SUBMIT, turn))
+        if result.is_rejected:
+            turn.status = TurnStatus.FAILED.value
+            turn.final_text = result.reason or "rejected"
+            self.history.save_turn(turn)
+            return turn
+        self.history.emit(
+            "user_message",
+            session_id=turn.session_id,
+            turn_id=turn.turn_id,
+            agent_id=turn.agent_id,
+            text=text,
+        )
+        self.publisher(turn.turn_id, "turn.started", {"session_id": turn.session_id, "text": text})
+        return turn
+
     def resume(self, session_id: str, answer: str) -> Turn:
         turn = self.history.load_turn(session_id)
         if not turn or turn.status != TurnStatus.PENDING.value:
             raise RuntimeError("No pending turn to resume")
         if turn.waiting_for != WaitingFor.HUMAN.value:
             raise RuntimeError("Pending turn is waiting for children, not a human answer")
+        call = self._pending_tool_call(turn)
+        call.human_params = parse_resume_answer(call.name, answer)
         self.history.emit(
             "human_params",
             session_id=turn.session_id,
@@ -150,26 +192,21 @@ class Runtime:
             agent_id=turn.agent_id,
             text=answer,
             wait_ids=turn.wait_ids,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            human_params=call.human_params,
         )
-        call_id = turn.wait_ids[0] if turn.wait_ids else new_id("call")
-        observation = Observation(
-            tool_call_id=call_id,
-            tool_name="ask_user",
-            summary=answer,
-        )
-        self._write_observation(turn, observation)
         turn.status = TurnStatus.RUNNING.value
         turn.waiting_for = None
         turn.wait_ids = []
         turn.resume_token = None
+        pending = self._handle_tools(turn, [call], replay=True)
+        if pending:
+            return pending
         return self._loop(turn)
 
     def cancel(self, turn_id: str | None = None) -> None:
-        """请求取消（外部/B 侧）：只写共享 Redis 标记 + History 状态，不清理、不 finish。
-
-        真正的收尾由正在跑 loop 的实例在下一个检查点读标记后 `_finish(CANCELLED)` 完成。
-        若这里直接 `_finish`，其 `cleanup_turn` 会删掉取消标记，导致 loop 实例读不到、取消失效。
-        """
+        """外部/B 侧只写共享标记 + History，不 cleanup、不 finish。"""
         self.cancelled = True
         turn = self.history.load_turn(self.session.session_id)
         if turn_id is None:
@@ -185,10 +222,31 @@ class Runtime:
             status=TurnStatus.CANCELLED.value,
             error=None,
         )
-        publish_event(self.store, turn_id, "turn.cancelled", {})
+        self.publisher(turn_id, "turn.cancelled", {})
+
+    def _hook_ctx(
+        self,
+        event: str,
+        turn: Turn | None,
+        *,
+        call: ToolCall | None = None,
+        tool: Tool | None = None,
+        observation: Observation | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> HookContext:
+        return HookContext(
+            event=event,
+            runtime=self,
+            turn=turn,
+            call=call,
+            tool=tool,
+            observation=observation,
+            extra=extra or {},
+        )
 
     def _stop_if_cancelled(self, turn: Turn) -> Turn | None:
         if self.cancelled or is_cancelled(self.store, turn.turn_id):
+            self._cancel_agent_tree()
             return self._finish(turn, TurnStatus.CANCELLED)
         return None
 
@@ -196,21 +254,21 @@ class Runtime:
         if not text:
             return
         event_type = "thinking.delta" if kind == "thinking" else "assistant.delta"
-        publish_event(self.store, turn.turn_id, event_type, {"text": text})
+        self.publisher(turn.turn_id, event_type, {"text": text})
 
     def _loop(self, turn: Turn) -> Turn:
+        if turn.status == TurnStatus.FAILED.value:
+            return turn
         self.history.save_turn(turn)
         for _ in range(self.config.max_steps):
-            if stopped := self._stop_if_cancelled(turn):
-                return stopped
+            before = self.hooks.run_before(BEFORE_LLM_CALL, self._hook_ctx(BEFORE_LLM_CALL, turn))
+            if before.is_rejected:
+                status = TurnStatus.CANCELLED if before.reason == "cancelled" else TurnStatus.FAILED
+                return self._finish(turn, status, before.reason)
             if self.context.should_compact(turn.session_id):
                 self._compact(turn)
-            messages = self.context.messages(turn.session_id, self.extra_system)
-            response = self.llm.complete(
-                messages,
-                self.schemas(),
-                on_delta=lambda kind, text, current=turn: self._on_llm_delta(current, kind, text),
-            )
+            response = self._call_llm(turn)
+            self.hooks.run_after(AFTER_LLM_CALL, self._hook_ctx(AFTER_LLM_CALL, turn, extra={"usage": response.usage}))
             if response.tool_calls:
                 pending = self._handle_tools(turn, response.tool_calls)
                 if pending:
@@ -227,68 +285,55 @@ class Runtime:
             return self._finish(turn, TurnStatus.COMPLETED)
         return self._finish(turn, TurnStatus.FAILED, "max_steps_exceeded")
 
-    def _handle_tools(self, turn: Turn, calls: list[ToolCall]) -> Turn | None:
+    def _call_llm(self, turn: Turn):
+        messages = self.context.messages(turn.session_id, self.extra_system)
+        return self.llm.complete(
+            messages,
+            self.schemas(),
+            on_delta=lambda kind, text, current=turn: self._on_llm_delta(current, kind, text),
+        )
+
+    def _handle_tools(self, turn: Turn, calls: list[ToolCall], *, replay: bool = False) -> Turn | None:
         wait_ids: list[str] = []
         for call in calls:
-            # before_tool 检查点：执行每个 Tool 前读一次取消标记
-            if stopped := self._stop_if_cancelled(turn):
-                return stopped
-            self.history.emit(
-                "tool_call",
-                session_id=turn.session_id,
-                turn_id=turn.turn_id,
-                agent_id=turn.agent_id,
-                tool_call_id=call.tool_call_id,
-                name=call.name,
-                arguments=call.arguments,
-            )
-            if call.name == "ask_user":
-                turn.status = TurnStatus.PENDING.value
-                turn.waiting_for = WaitingFor.HUMAN.value
-                turn.wait_ids = [call.tool_call_id]
-                turn.resume_token = new_id("tok")
-                self.history.save_turn(turn)
-                publish_event(
-                    self.store,
-                    turn.turn_id,
-                    "ask_user",
-                    {"question": (call.arguments or {}).get("question") or "", "tool_call_id": call.tool_call_id},
-                )
-                return turn
-            if call.name == "spawn":
-                wait_ids.append(call.tool_call_id)
-                observation = self._spawn(turn, call)
-                self._write_observation(turn, observation)
-                continue
-            if call.name == "remember":
-                record = self.memory.upsert(
-                    slot=str(call.arguments["slot"]),
-                    text=str(call.arguments["text"]),
-                    layer=str(call.arguments.get("layer") or "profile"),
-                    source_turn_id=turn.turn_id,
-                    source_session_id=turn.session_id,
-                )
+            if not replay:
                 self.history.emit(
-                    "reminder",
+                    "tool_call",
                     session_id=turn.session_id,
                     turn_id=turn.turn_id,
                     agent_id=turn.agent_id,
-                    text=f"Memory upserted: {record.slot} = {record.text}",
+                    tool_call_id=call.tool_call_id,
+                    name=call.name,
+                    arguments=call.arguments,
                 )
-                self._write_observation(
-                    turn,
-                    bind(
-                        Observation(
-                            tool_call_id=call.tool_call_id,
-                            tool_name="remember",
-                            summary=f"Stored {record.slot}",
-                            refs=[record.slot],
-                        ),
-                        call,
-                    ),
-                )
-                continue
             tool = self.tools.get(call.name)
+            result = self._before_tool(turn, call, tool)
+            if result.is_rejected and result.reason == "cancelled":
+                return self._finish(turn, TurnStatus.CANCELLED)
+            if result.is_rejected:
+                observation = result.observation or Observation(
+                    tool_call_id=call.tool_call_id,
+                    tool_name=call.name,
+                    outcome="fail",
+                    summary=result.reason or "rejected",
+                    error=result.reason or "rejected",
+                )
+                self._write_observation(turn, observation)
+                continue
+            if result.is_pending:
+                return self._enter_pending(turn, call, result)
+            if result.is_reuse and result.observation is not None:
+                self._write_observation(turn, result.observation)
+                continue
+            if call.name == "spawn":
+                wait_ids.append(call.tool_call_id)
+                observation = self._spawn(turn, call)
+                self._after_tool(turn, call, tool, observation)
+                continue
+            if call.name == "remember":
+                observation = self._remember(turn, call)
+                self._after_tool(turn, call, tool, observation)
+                continue
             if tool is None:
                 self._write_observation(
                     turn,
@@ -301,30 +346,14 @@ class Runtime:
                     ),
                 )
                 continue
-            cached = self._begin_write(turn, call)
-            if cached is not None:
-                self._write_observation(turn, cached)
-                continue
-            publish_event(
-                self.store,
+            self.publisher(
                 turn.turn_id,
                 "tool.started",
                 {"tool_call_id": call.tool_call_id, "name": call.name, "arguments": call.arguments},
             )
-            try:
-                observation = bind(tool.run(**call.arguments), call)
-            except Exception as exc:  # noqa: BLE001 - tool errors become observations
-                observation = Observation(
-                    tool_call_id=call.tool_call_id,
-                    tool_name=call.name,
-                    outcome="fail",
-                    summary=str(exc),
-                    error=type(exc).__name__,
-                )
-            self._complete_write(turn, call, observation)
-            self._write_observation(turn, observation)
+            observation = self.executor.run(self, tool, call)
+            self._after_tool(turn, call, tool, observation)
         if wait_ids:
-            # Children run inline in v1; pending is recorded only if a child stays open.
             open_ids = [item for item in wait_ids if self._child_still_open(item)]
             if open_ids:
                 turn.status = TurnStatus.PENDING.value
@@ -333,6 +362,86 @@ class Runtime:
                 self.history.save_turn(turn)
                 return turn
         return None
+
+    def _before_tool(self, turn: Turn, call: ToolCall, tool: Tool | None) -> HookResult:
+        ctx = self._hook_ctx(BEFORE_TOOL, turn, call=call, tool=tool)
+        result = self.hooks.run_before(BEFORE_TOOL, ctx)
+        if result.action != "continue":
+            return result
+        if tool and tool.before_hooks:
+            return self.hooks.run_before_list(tool.before_hooks, ctx)
+        return result
+
+    def _after_tool(self, turn: Turn, call: ToolCall, tool: Tool | None, observation: Observation) -> None:
+        ctx = self._hook_ctx(AFTER_TOOL_CALL, turn, call=call, tool=tool, observation=observation)
+        self.hooks.run_after(AFTER_TOOL_CALL, ctx)
+        if tool and tool.after_hooks:
+            self.hooks.run_after_list(tool.after_hooks, ctx)
+        self._write_observation(turn, observation)
+
+    def _enter_pending(self, turn: Turn, call: ToolCall, result: HookResult) -> Turn:
+        turn.status = TurnStatus.PENDING.value
+        turn.waiting_for = result.waiting_for or WaitingFor.HUMAN.value
+        turn.wait_ids = [call.tool_call_id]
+        turn.resume_token = new_resume_token()
+        self.history.save_turn(turn)
+        self.history.emit(
+            "permission",
+            session_id=turn.session_id,
+            turn_id=turn.turn_id,
+            agent_id=turn.agent_id,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.name,
+            reason=result.reason,
+            human_params_schema=result.human_params_schema,
+        )
+        self.publisher(
+            turn.turn_id,
+            result.event_type or "permission.pending",
+            {
+                "question": result.question,
+                "tool_call_id": call.tool_call_id,
+                "tool_name": call.name,
+                "reason": result.reason,
+            },
+        )
+        return turn
+
+    def _pending_tool_call(self, turn: Turn) -> ToolCall:
+        call_id = turn.wait_ids[0] if turn.wait_ids else ""
+        for event in reversed(self.history.events(turn.session_id)):
+            if event.type == "tool_call" and event.payload.get("tool_call_id") == call_id:
+                return ToolCall(
+                    tool_call_id=call_id,
+                    name=str(event.payload.get("name") or ""),
+                    arguments=dict(event.payload.get("arguments") or {}),
+                )
+        raise RuntimeError("Pending tool call not found in history")
+
+    def _remember(self, turn: Turn, call: ToolCall) -> Observation:
+        record = self.memory.upsert(
+            slot=str(call.arguments["slot"]),
+            text=str(call.arguments["text"]),
+            layer=str(call.arguments.get("layer") or "profile"),
+            source_turn_id=turn.turn_id,
+            source_session_id=turn.session_id,
+        )
+        self.history.emit(
+            "reminder",
+            session_id=turn.session_id,
+            turn_id=turn.turn_id,
+            agent_id=turn.agent_id,
+            text=f"Memory upserted: {record.slot} = {record.text}",
+        )
+        return bind(
+            Observation(
+                tool_call_id=call.tool_call_id,
+                tool_name="remember",
+                summary=f"Stored {record.slot}",
+                refs=[record.slot],
+            ),
+            call,
+        )
 
     def _spawn(self, turn: Turn, call: ToolCall) -> Observation:
         template = str(call.arguments.get("template") or "general")
@@ -345,7 +454,7 @@ class Runtime:
                 extra += "\n\nFollow this graph:\n" + path.read_text(encoding="utf-8")
         allowed = None
         if template == "explore":
-            allowed = {"read_file", "search_web", "ask_user"}
+            allowed = {"read_file", "search_web", "ask_user", "read_artifact_range"}
         child = Runtime.create(
             self.config,
             user_id=self.session.user_id,
@@ -357,8 +466,21 @@ class Runtime:
             extra_system=extra,
             allowed_tools=allowed,
             store=self.store,
+            hooks=self.hooks,
+            executor=self.executor,
         )
         child_turn = child.run(goal)
+        self.sub_agent_ids.append(child.session.agent_id)
+        self.history.emit(
+            "agent_created",
+            session_id=turn.session_id,
+            turn_id=turn.turn_id,
+            agent_id=turn.agent_id,
+            parent_agent_id=self.session.agent_id,
+            child_agent_id=child.session.agent_id,
+            child_session_id=child.session.session_id,
+            child_turn_id=child_turn.turn_id,
+        )
         outcome = "pass" if child_turn.status == TurnStatus.COMPLETED.value else "fail"
         if child_turn.status == TurnStatus.PENDING.value:
             outcome = "partial"
@@ -374,40 +496,13 @@ class Runtime:
     def _child_still_open(self, _tool_call_id: str) -> bool:
         return False
 
-    def _write_key(self, turn: Turn, call: ToolCall) -> str:
-        payload = json.dumps(
-            {"tool": call.name, "arguments": call.arguments, "human": call.human_params},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        digest = hashlib.sha256(payload.encode()).hexdigest()[:24]
-        return f"turn:{turn.turn_id}:tool:idem:{digest}"
-
-    def _begin_write(self, turn: Turn, call: ToolCall) -> Observation | None:
-        if call.name not in {"write_file", "bash"}:
-            return None
-        key = self._write_key(turn, call)
-        claimed = self.store.set(key, "running", nx=True, ex=86400)
-        self.store.sadd(resources_key(turn.turn_id), key)
-        if claimed:
-            return None
-        raw = self.store.get(key)
-        if raw and raw not in {"running"}:
-            try:
-                return Observation.from_dict(json.loads(raw))
-            except json.JSONDecodeError:
-                return None
-        return Observation(
-            tool_call_id=call.tool_call_id,
-            tool_name=call.name,
-            summary="duplicate write skipped",
-            preview="idempotent",
-        )
-
-    def _complete_write(self, turn: Turn, call: ToolCall, observation: Observation) -> None:
-        if call.name not in {"write_file", "bash"}:
-            return
-        self.store.set(self._write_key(turn, call), json.dumps(observation.to_dict(), ensure_ascii=False), ex=86400)
+    def _cancel_agent_tree(self) -> None:
+        for event in self.history.events(self.session.session_id):
+            if event.type != "agent_created":
+                continue
+            child_turn_id = event.payload.get("child_turn_id")
+            if child_turn_id:
+                request_cancel(self.store, str(child_turn_id))
 
     def _write_observation(self, turn: Turn, observation: Observation) -> None:
         self.history.emit(
@@ -417,10 +512,12 @@ class Runtime:
             agent_id=turn.agent_id,
             **observation.to_dict(),
         )
-        publish_event(self.store, turn.turn_id, "tool.completed", observation.to_dict())
+        self.publisher(turn.turn_id, "tool.completed", observation.to_dict())
 
     def _compact(self, turn: Turn) -> None:
+        self.hooks.run_before(PRE_COMPACT, self._hook_ctx(PRE_COMPACT, turn))
         compact_llm = LLM(self.config, small=True)
+        events = self.history.events(turn.session_id)
         messages = [
             {
                 "role": "system",
@@ -428,25 +525,34 @@ class Runtime:
             },
             {
                 "role": "user",
-                "content": json.dumps(
-                    [event.to_dict() for event in self.history.events(turn.session_id)][-40:],
-                    ensure_ascii=False,
-                ),
+                "content": json.dumps([event.to_dict() for event in events[-40:]], ensure_ascii=False),
             },
         ]
         try:
             summary = compact_llm.complete(messages, tools=None).text.strip()
         except Exception:  # noqa: BLE001
-            return  # 静默跳过：不写误导性的 checkpoint
-        self.context.compact(turn.session_id, turn.turn_id, turn.agent_id, summary)
+            self.context.note_compact_failed(turn.session_id)
+            return
+        if not summary:
+            self.context.note_compact_failed(turn.session_id)
+            return
+        self.context.compact(
+            turn.session_id,
+            turn.turn_id,
+            turn.agent_id,
+            summary,
+            covers_events=self.context.covered_event_ids(turn.session_id),
+        )
 
     def _finish(self, turn: Turn, status: TurnStatus, error: str | None = None) -> Turn:
         turn.status = status.value
         if error:
             turn.final_text = turn.final_text or error
         self.history.save_turn(turn)
-        publish_event(self.store, turn.turn_id, f"turn.{turn.status}", {"error": error})
+        self.publisher(turn.turn_id, f"turn.{turn.status}", {"error": error})
         if status.value in {TurnStatus.COMPLETED.value, TurnStatus.FAILED.value, TurnStatus.CANCELLED.value}:
+            self.hooks.run_after(AFTER_TURN, self._hook_ctx(AFTER_TURN, turn))
+            self.hooks.run_after(TURN_CLEANUP, self._hook_ctx(TURN_CLEANUP, turn))
             cleanup_turn(self.store, turn.turn_id)
         self.history.emit(
             "turn_status",

@@ -6,7 +6,6 @@ import typer
 
 from harness.config import Config
 from harness.runtime import Runtime
-from harness.store import request_cancel
 from harness.types import TurnStatus
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -45,7 +44,6 @@ def cancel(
     turn = runtime.history.load_turn(session)
     if turn is None:
         raise typer.BadParameter("no turn to cancel")
-    request_cancel(runtime.store, turn.turn_id)
     runtime.cancel(turn.turn_id)
     latest = runtime.history.load_turn(session) or turn
     _print_turn(runtime, latest)

@@ -27,6 +27,7 @@ class ContextBuilder:
         self.config = config
         self.history = history
         self.memory = memory
+        self._compact_hold_chars: int | None = None
 
     def system_prompt(self, extra: str = "") -> str:
         agents = _read(self.config.prompts_dir / "AGENTS.md")
@@ -53,10 +54,7 @@ class ContextBuilder:
 
     def messages(self, session_id: str, extra_system: str = "") -> list[dict[str, Any]]:
         events = self.history.events(session_id)
-        start = 0
-        for index, event in enumerate(events):
-            if event.type == "summary_checkpoint":
-                start = index
+        start = self._checkpoint_start(events)
         messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt(extra_system)}]
         for event in events[start:]:
             converted = self._event_message(event)
@@ -65,26 +63,54 @@ class ContextBuilder:
         return messages
 
     def should_compact(self, session_id: str) -> bool:
-        events = self.history.events(session_id)
-        # 只统计最后一个 checkpoint 之后的事件（即真正会注入 LLM 的部分），
-        # 否则压缩后历史总量仍超限，会在每个 step 反复压缩，陷入死循环。
-        start = 0
-        for index, event in enumerate(events):
-            if event.type == "summary_checkpoint":
-                start = index
-        total = 0
-        for event in events[start:]:
-            total += len(json.dumps(event.payload, ensure_ascii=False))
-        return total > self.config.compact_chars
+        total = self._post_checkpoint_chars(session_id)
+        if total <= self.config.compact_chars:
+            return False
+        if self._compact_hold_chars is not None and total <= self._compact_hold_chars:
+            return False
+        return True
 
-    def compact(self, session_id: str, turn_id: str, agent_id: str, summary: str) -> None:
+    def note_compact_failed(self, session_id: str) -> None:
+        # Compact 失败不写假 checkpoint；记下当前窗口大小，避免每步空转。
+        self._compact_hold_chars = self._post_checkpoint_chars(session_id)
+
+    def compact(
+        self,
+        session_id: str,
+        turn_id: str,
+        agent_id: str,
+        summary: str,
+        covers_events: list[str] | None = None,
+    ) -> None:
+        self._compact_hold_chars = None
         self.history.emit(
             "summary_checkpoint",
             session_id=session_id,
             turn_id=turn_id,
             agent_id=agent_id,
             summary=summary,
+            covers_events=covers_events or [],
         )
+
+    def _checkpoint_start(self, events: list[Event]) -> int:
+        start = 0
+        for index, event in enumerate(events):
+            if event.type == "summary_checkpoint":
+                start = index
+        return start
+
+    def _post_checkpoint_chars(self, session_id: str) -> int:
+        events = self.history.events(session_id)
+        start = self._checkpoint_start(events)
+        return sum(len(json.dumps(event.payload, ensure_ascii=False)) for event in events[start:])
+
+    def covered_event_ids(self, session_id: str) -> list[str]:
+        events = self.history.events(session_id)
+        start = self._checkpoint_start(events)
+        covered = events[start:]
+        if covered and covered[0].type == "summary_checkpoint":
+            covered = covered[1:]
+        return [event.event_id for event in covered]
 
     def _event_message(self, event: Event) -> dict[str, Any] | None:
         payload = event.payload

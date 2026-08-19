@@ -76,6 +76,7 @@
           return add("proc", mark + " <b>" + esc(name) + "</b><br>" + esc(summary));
         }
         case "ask_user": return add("proc", "❓ 等待回答：" + esc(p.question || ""));
+        case "permission.pending": return add("proc", "🔐 等待审批：" + esc(p.question || p.tool_name || "tool"));
         case "turn.completed": return add("proc", "🏁 完成");
         case "turn.failed": return add("proc", "❌ 失败" + (p.error ? "：" + esc(p.error) : ""));
         case "turn.cancelled": return add("proc", "⛔ 已取消");

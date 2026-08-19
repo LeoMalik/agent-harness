@@ -6,6 +6,7 @@
   ],
   "functions": {
     "api/**/*.py": {
+      "maxDuration": 60,
       "excludeFiles": "{tests/**,data/**,.venv/**}"
     }
   }

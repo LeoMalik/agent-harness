@@ -97,6 +97,7 @@ class Turn:
     resume_token: str | None = None
     user_text: str = ""
     final_text: str | None = None
+    updated_at: str = field(default_factory=now_iso)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

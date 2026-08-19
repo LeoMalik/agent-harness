@@ -30,9 +30,12 @@ class Config:
     handshake_token: str = os.getenv("HARNESS_HANDSHAKE_TOKEN", "harness-ok")
     max_steps: int = 16
     max_agent_depth: int = 2
+    max_tool_retries: int = int(os.getenv("HARNESS_MAX_TOOL_RETRIES", "0"))
+    hook_timeout_seconds: int = int(os.getenv("HARNESS_HOOK_TIMEOUT", "30"))
     compact_chars: int = int(os.getenv("HARNESS_COMPACT_CHARS", "500_000"))
     max_inline_chars: int = 8_000
     tool_timeout: int = 30
+    artifact_range_bytes: int = 64 * 1024
 
     def db(self):
         if not self.supabase_url or not self.supabase_service_role_key:

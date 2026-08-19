@@ -3,8 +3,12 @@
 A small Python harness from the Agent Learning Notes:
 
 - Turn states: `running` / `pending` / `completed` / `cancelled` / `failed`
-- Tools: `read_file`, `write_file`, `bash`, `search_web`, `remember`, `ask_user`, `spawn`
-- JSONL history locally, or Supabase when `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are set
+- Lifecycle hooks: `session_start`, `user_prompt_submit`, `before_llm_call`, `after_llm_call`, `before_tool`, `after_tool_call`, `pre_compact`, `after_turn`
+- Before-hooks are sync and time out after `HARNESS_HOOK_TIMEOUT` (default 30s, fail-closed)
+- After-hooks persist memory / metrics in the background and never reject
+- Each tool has its own `before_hooks` / `after_hooks` (empty unless needed). `ask_user` has an interrupt hook; `write_file` / `bash` have approval + idempotency
+- Per-user credits in `user_balances` (default 1_000_000, 1 credit per turn)
+- History, memory, artifacts, and balances go to Supabase (`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`)
 - Redis via `REDIS_URL`: cancel flag, turn event stream, write idempotency
 
 ## Setup
@@ -27,7 +31,6 @@ uv run harness resume --session ses_xxx "France"
 uv run harness cancel --session ses_xxx
 ```
 
-Without Supabase credentials, sessions stay under `data/sessions/`.
-With Supabase, history, memory, and artifacts go to Postgres.
+Supabase is required for sessions, events, memory, and artifacts.
 
 HTTP handshake after Vercel deploy: `GET /` or `GET /handshake`.

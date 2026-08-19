@@ -249,8 +249,8 @@ def test_cancel_flag_and_idempotent_write(tmp_path, monkeypatch):
     runtime = make_runtime(
         tmp_path,
         [
-            ModelResponse(tool_calls=[ToolCall("c1", "write_file", {"path": "out.md", "content": "once"})]),
-            ModelResponse(tool_calls=[ToolCall("c2", "write_file", {"path": "out.md", "content": "once"})]),
+            ModelResponse(tool_calls=[ToolCall("c1", "write_file", {"path": "out.md", "content": "once"}, human_params={"approve": True})]),
+            ModelResponse(tool_calls=[ToolCall("c2", "write_file", {"path": "out.md", "content": "once"}, human_params={"approve": True})]),
             ModelResponse(text="wrote"),
         ],
         monkeypatch,
@@ -301,3 +301,81 @@ def test_before_tool_checkpoint_blocks_tools_when_cancelled(tmp_path, monkeypatc
     # before_tool 检查点拦住了所有 tool，没有写入任何文件
     assert "agent-files/local/files/a.md" not in db.files
     assert "agent-files/local/files/b.md" not in db.files
+
+
+def test_write_file_requires_approval_then_resume(tmp_path, monkeypatch):
+    db = FakeDB()
+    runtime = make_runtime(
+        tmp_path,
+        [
+            ModelResponse(tool_calls=[ToolCall("c-write", "write_file", {"path": "out.md", "content": "secret"})]),
+            ModelResponse(text="wrote after approval"),
+        ],
+        monkeypatch,
+        db=db,
+    )
+    turn = runtime.run("write a file")
+    assert turn.status == TurnStatus.PENDING.value
+    assert turn.waiting_for == "human"
+    assert "agent-files/local/files/out.md" not in db.files
+    resumed = runtime.resume(runtime.session.session_id, "yes")
+    assert resumed.status == TurnStatus.COMPLETED.value
+    assert db.files["agent-files/local/files/out.md"] == "secret"
+    assert any(event.type == "permission" for event in runtime.history.events(runtime.session.session_id))
+
+
+def test_checkpoint_records_covers_events(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    history = History(config)
+    first = history.append(Event(type="user_message", session_id="s3", payload={"text": "old"}))
+    builder = ContextBuilder(config, history, Memory(config, "u", "w"))
+    builder.compact("s3", "t1", "a1", "keep this", covers_events=builder.covered_event_ids("s3"))
+    events = history.events("s3")
+    checkpoint = next(event for event in events if event.type == "summary_checkpoint")
+    assert checkpoint.payload["covers_events"] == [first.event_id]
+
+
+def test_read_artifact_range(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    db.insert("artifacts", {"artifact_id": "art_1", "content": "abcdefghij", "preview": "abc"})
+    tools = default_tools(config, tmp_path)
+    observation = tools["read_artifact_range"].run(artifact_id="art_1", start_byte=2, end_byte=5)
+    assert observation.summary == "cdef"
+    assert observation.artifact_id == "art_1"
+
+
+def test_session_start_seeds_balance_and_turn_debits(tmp_path, monkeypatch):
+    db = FakeDB()
+    runtime = make_runtime(tmp_path, [ModelResponse(text="ok")], monkeypatch, db=db)
+    rows = db.select("user_balances", {"user_id": "eq.local"})
+    assert rows
+    assert int(rows[0]["credits"]) == 1_000_000
+    runtime.run("hi")
+    rows = db.select("user_balances", {"user_id": "eq.local"})
+    assert int(rows[0]["credits"]) == 999_999
+
+
+def test_insufficient_balance_rejects_turn(tmp_path, monkeypatch):
+    db = FakeDB()
+    runtime = make_runtime(tmp_path, [ModelResponse(text="should not run")], monkeypatch, db=db)
+    db.upsert("user_balances", {"user_id": "local", "credits": 0, "updated_at": "now"}, "user_id")
+    turn = runtime.run("hi")
+    assert turn.status == TurnStatus.FAILED.value
+    assert "insufficient_balance" in (turn.final_text or "")
+
+
+def test_every_tool_has_hook_lists_and_ask_user_interrupts(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    tools = default_tools(config, tmp_path)
+    for tool in tools.values():
+        assert isinstance(tool.before_hooks, list)
+        assert isinstance(tool.after_hooks, list)
+    assert any(hook.name == "interrupt" for hook in tools["ask_user"].before_hooks)
+    assert any(hook.name == "approval" for hook in tools["write_file"].before_hooks)
+    assert any(hook.name == "approval" for hook in tools["bash"].before_hooks)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from harness.config import Config
-from harness.types import Event, Session, Turn
+from harness.types import Event, Session, Turn, now_iso
 
 
 class History:
@@ -43,6 +43,7 @@ class History:
         return Session.from_dict(rows[0]) if rows else None
 
     def save_turn(self, turn: Turn) -> None:
+        turn.updated_at = now_iso()
         self.db.upsert("turns", turn.to_dict(), "turn_id")
 
     def load_turn(self, session_id: str) -> Turn | None:
