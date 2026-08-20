@@ -151,13 +151,19 @@ class Runtime:
         return items
 
     def run(self, text: str) -> Turn:
-        return self._loop(self.start_turn(text))
+        return self._run_loop_safely(self.start_turn(text))
+
+    def _run_loop_safely(self, turn: Turn) -> Turn:
+        try:
+            return self._loop(turn)
+        except Exception as exc:  # noqa: BLE001 - 异常转成失败 turn，避免卡在 running
+            return self._finish(turn, TurnStatus.FAILED, f"{type(exc).__name__}: {exc}")
 
     def continue_turn(self) -> Turn:
         turn = self.history.load_turn(self.session.session_id)
         if turn is None:
             raise RuntimeError("No turn to continue")
-        return self._loop(turn)
+        return self._run_loop_safely(turn)
 
     def on_session_start(self) -> None:
         self.hooks.run_before(SESSION_START, self._hook_ctx(SESSION_START, None))
@@ -218,7 +224,7 @@ class Runtime:
         pending = self._handle_tools(turn, [call], replay=True)
         if pending:
             return pending
-        return self._loop(turn)
+        return self._run_loop_safely(turn)
 
     def cancel(self, turn_id: str | None = None) -> None:
         """外部/B 侧只写共享标记 + History，不 cleanup、不 finish。"""
@@ -285,7 +291,7 @@ class Runtime:
             response = self._call_llm(turn)
             self.hooks.run_after(AFTER_LLM_CALL, self._hook_ctx(AFTER_LLM_CALL, turn, extra={"usage": response.usage}))
             if response.tool_calls:
-                pending = self._handle_tools(turn, response.tool_calls)
+                pending = self._handle_tools(turn, response.tool_calls, thinking=response.thinking)
                 if pending:
                     return pending
                 continue
@@ -312,7 +318,7 @@ class Runtime:
             on_delta=lambda kind, text, current=turn: self._on_llm_delta(current, kind, text),
         )
 
-    def _handle_tools(self, turn: Turn, calls: list[ToolCall], *, replay: bool = False) -> Turn | None:
+    def _handle_tools(self, turn: Turn, calls: list[ToolCall], *, replay: bool = False, thinking: str = "") -> Turn | None:
         wait_ids: list[str] = []
         for call in calls:
             if not replay:
@@ -324,6 +330,7 @@ class Runtime:
                     tool_call_id=call.tool_call_id,
                     name=call.name,
                     arguments=call.arguments,
+                    thinking=thinking,
                 )
             tool = self.tools.get(call.name)
             result = self._before_tool(turn, call, tool)

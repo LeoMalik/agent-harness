@@ -42,7 +42,7 @@ const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>]/g,c
 let workspaceId=params.get('workspace_id')||localStorage.getItem('harness-workspace')||'default',sessionId=null,filter='all',sessions=[],settings=null,running=false,pending=false,pollTimer=null,thinkEl=null,assistantEl=null,statusEl=null,seen=new Set();
 const labels={low:'低',medium:'中',high:'高'};
 $('userLabel').textContent=userId;
-async function api(path,opt={}){const r=await fetch(API+path,{headers:{'Content-Type':'application/json',...(opt.headers||{})},...opt});const d=await r.json();if(!r.ok)throw new Error(d.error||r.statusText);return d}
+async function api(path,opt={}){const r=await fetch(API+path,{headers:{'Content-Type':'application/json',...(opt.headers||{})},...opt});const d=await r.json();if(!r.ok)throw new Error(d.message||d.error||r.statusText);return d}
 function message(cls,text){$('empty')?.remove();const d=document.createElement('div');d.className='msg '+cls;d.textContent=text;$('chat').appendChild(d);$('chat').scrollTop=$('chat').scrollHeight;return d}
 function eventRow(text,fail=false){$('empty')?.remove();const d=document.createElement('div');d.className='event'+(fail?' fail':'');d.textContent=text;$('chat').appendChild(d);$('chat').scrollTop=$('chat').scrollHeight;return d}
 function clearLiveStatus(){statusEl?.remove();statusEl=null}

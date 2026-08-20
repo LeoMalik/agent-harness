@@ -234,6 +234,66 @@ def test_skill_catalog_prefers_frontmatter_description(tmp_path, monkeypatch):
     assert "---" not in catalog
 
 
+def test_tool_call_message_keeps_reasoning_content(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    history = History(config)
+    history.append(Event(type="user_message", session_id="s1", payload={"text": "hi"}))
+    history.append(
+        Event(
+            type="tool_call",
+            session_id="s1",
+            payload={
+                "tool_call_id": "call_1",
+                "name": "search_web",
+                "arguments": {"query": "x"},
+                "thinking": "step by step",
+            },
+        )
+    )
+    history.append(
+        Event(
+            type="observation",
+            session_id="s1",
+            payload={"tool_call_id": "call_1", "tool_name": "search_web", "outcome": "pass", "summary": "ok"},
+        )
+    )
+    builder = ContextBuilder(config, history, Memory(config, "u", "w"))
+    messages = builder.messages("s1")
+    assistant = next(item for item in messages if item.get("tool_calls"))
+    assert assistant["reasoning_content"] == "step by step"
+    assert assistant["tool_calls"][0]["function"]["name"] == "search_web"
+
+
+def test_run_marks_turn_failed_on_exception(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path, [ModelResponse(text="ok")], monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runtime.llm, "complete", boom)
+    turn = runtime.run("hi")
+    assert turn.status == TurnStatus.FAILED.value
+    assert "RuntimeError" in (turn.final_text or "")
+    assert "boom" in (turn.final_text or "")
+
+
+def test_handle_tools_persists_thinking(tmp_path, monkeypatch):
+    runtime = make_runtime(
+        tmp_path,
+        [
+            ModelResponse(thinking="think step", tool_calls=[ToolCall(tool_call_id="call_1", name="search_web", arguments={"query": "x"})]),
+            ModelResponse(text="final"),
+        ],
+        monkeypatch,
+    )
+    turn = runtime.run("hi")
+    tool_calls = [e for e in runtime.history.events(turn.session_id) if e.type == "tool_call"]
+    assert tool_calls
+    assert tool_calls[0].payload.get("thinking") == "think step"
+
+
 def test_write_file_tool(tmp_path, monkeypatch):
     db = FakeDB()
     config = make_config(tmp_path)

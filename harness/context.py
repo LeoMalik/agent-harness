@@ -130,7 +130,7 @@ class ContextBuilder:
         if event.type == "summary_checkpoint":
             return {"role": "assistant", "content": f"[checkpoint]\n{payload.get('summary', '')}"}
         if event.type == "tool_call":
-            return {
+            message = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [
@@ -144,6 +144,12 @@ class ContextBuilder:
                     }
                 ],
             }
+            thinking = payload.get("thinking") or payload.get("reasoning_content") or ""
+            if thinking:
+                # 推理模型（思考模式，如 deepseek-v4-flash）要求把上一轮 tool-call 的
+                # reasoning_content 原样传回，否则下一次调用返回 400。
+                message["reasoning_content"] = thinking
+            return message
         if event.type == "observation":
             observation = Observation.from_dict(payload)
             return {
