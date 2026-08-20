@@ -37,9 +37,9 @@
 </div>
 <div class="modal" id="settingsModal"><div class="dialog"><div class="dialog-head">人设与模型<button class="icon-btn" id="closeSettings" style="margin-left:auto">×</button></div><div class="dialog-body"><div class="field"><label>默认模型</label><select id="settingModel"></select></div><div class="field"><label>思考强度</label><select id="settingEffort"><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></div><div class="field"><label>SOUL.md · 用户默认人设</label><textarea id="settingSoul" spellcheck="false"></textarea></div></div><div class="dialog-foot"><button class="btn" id="cancelSettings">取消</button><button class="btn primary" id="saveSettings">保存</button></div></div></div>
 <script>
-const API='https://agent-harness-app.vercel.app', userId=localStorage.getItem('harness-user')||'local';
+const API='https://agent-harness-app.vercel.app', params=new URLSearchParams(location.search), userId=params.get('user_id')||localStorage.getItem('harness-user')||'local';
 const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-let workspaceId=localStorage.getItem('harness-workspace')||'default',sessionId=null,filter='all',sessions=[],settings=null,running=false,pending=false,pollTimer=null,thinkEl=null,seen=new Set();
+let workspaceId=params.get('workspace_id')||localStorage.getItem('harness-workspace')||'default',sessionId=null,filter='all',sessions=[],settings=null,running=false,pending=false,pollTimer=null,thinkEl=null,seen=new Set();
 const labels={low:'低',medium:'中',high:'高'};
 $('userLabel').textContent=userId;
 async function api(path,opt={}){const r=await fetch(API+path,{headers:{'Content-Type':'application/json',...(opt.headers||{})},...opt});const d=await r.json();if(!r.ok)throw new Error(d.error||r.statusText);return d}
