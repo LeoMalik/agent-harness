@@ -436,6 +436,54 @@ def test_llm_payload_includes_reasoning_effort(tmp_path, monkeypatch):
     assert captured["reasoning_effort"] == "high"
 
 
+def test_llm_falls_back_before_first_stream_delta(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    from harness.llm import LLM
+
+    llm = LLM(config)
+    calls = []
+    monkeypatch.setattr(type(llm), "api_key", property(lambda self: "key"))
+    monkeypatch.setattr(llm, "_stream", lambda body, on_delta: (_ for _ in ()).throw(ConnectionError("no stream")))
+    monkeypatch.setattr(
+        llm,
+        "_once",
+        lambda body, on_delta: calls.append(dict(body)) or ModelResponse(text="fallback"),
+    )
+
+    response = llm.complete([{"role": "user", "content": "hi"}])
+
+    assert response.text == "fallback"
+    assert calls == [{"model": llm.model, "messages": [{"role": "user", "content": "hi"}], "temperature": 0.2, "stream": False, "reasoning_effort": "medium"}]
+
+
+def test_llm_does_not_fallback_after_stream_delta(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    from harness.llm import LLM
+
+    llm = LLM(config)
+    deltas = []
+    fallback_called = False
+    monkeypatch.setattr(type(llm), "api_key", property(lambda self: "key"))
+
+    def partial_stream(body, on_delta):
+        on_delta("thinking", "partial")
+        raise ConnectionError("stream interrupted")
+
+    def fallback(body, on_delta):
+        nonlocal fallback_called
+        fallback_called = True
+        return ModelResponse(text="duplicate")
+
+    monkeypatch.setattr(llm, "_stream", partial_stream)
+    monkeypatch.setattr(llm, "_once", fallback)
+
+    with pytest.raises(ConnectionError, match="stream interrupted"):
+        llm.complete([{"role": "user", "content": "hi"}], on_delta=lambda kind, text: deltas.append((kind, text)))
+
+    assert deltas == [("thinking", "partial")]
+    assert fallback_called is False
+
+
 def test_title_sanitizer_enforces_concise_contract():
     chinese = sanitize_session_title('标题：**讨论新的绘画工作区设计方案。**', '请设计一个新的绘画工作区')
     assert chinese == '讨论新的绘画工作区设计方'

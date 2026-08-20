@@ -61,9 +61,20 @@ class LLM:
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
+        emitted_delta = False
+
+        def track_delta(kind: str, text: str) -> None:
+            nonlocal emitted_delta
+            if text:
+                emitted_delta = True
+            if on_delta:
+                on_delta(kind, text)
+
         try:
-            return self._stream(body, on_delta)
+            return self._stream(body, track_delta)
         except Exception:
+            if emitted_delta:
+                raise
             body["stream"] = False
             return self._once(body, on_delta)
 
