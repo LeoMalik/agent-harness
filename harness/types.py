@@ -120,6 +120,12 @@ class Session:
     parent_session_id: str | None = None
     parent_agent_id: str | None = None
     created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
+    title: str = ""
+    starred: bool = False
+    archived: bool = False
+    trashed: bool = False
+    unread: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

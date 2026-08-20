@@ -13,17 +13,26 @@ DeltaFn = Callable[[str, str], None]
 
 
 class LLM:
-    def __init__(self, config: Config, small: bool = False):
+    def __init__(
+        self,
+        config: Config,
+        small: bool = False,
+        model_override: str | None = None,
+        reasoning_effort: str = "medium",
+    ):
         self.config = config
         self.small = small
+        self.model_override = model_override
+        self.reasoning_effort = reasoning_effort
 
     @property
     def _use_small(self) -> bool:
-        return self.small and bool(self.config.small_api_key)
+        wants_small = self.small or self.model_override == self.config.small_model
+        return wants_small and bool(self.config.small_api_key)
 
     @property
     def model(self) -> str:
-        return self.config.small_model if self._use_small else self.config.model
+        return self.model_override or (self.config.small_model if self._use_small else self.config.model)
 
     @property
     def base_url(self) -> str:
@@ -47,6 +56,7 @@ class LLM:
             "messages": messages,
             "temperature": temperature,
             "stream": True,
+            "reasoning_effort": self.reasoning_effort,
         }
         if tools:
             body["tools"] = tools

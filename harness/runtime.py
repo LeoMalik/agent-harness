@@ -37,6 +37,7 @@ from harness.store import (
     request_cancel,
 )
 from harness.tools import Tool, bind, default_tools, spawn_schema
+from harness.user_settings import UserSettings, UserSettingsStore
 from harness.types import (
     Observation,
     Session,
@@ -68,6 +69,7 @@ class Runtime:
     store: Store
     hooks: HookBus
     executor: ToolExecutor
+    user_settings: UserSettings
     cancelled: bool = False
     depth: int = 0
     extra_system: str = ""
@@ -95,7 +97,6 @@ class Runtime:
         config = config or Config()
         cwd = (cwd or Path.cwd()).resolve()
         history = History(config)
-        memory = Memory(config, user_id, workspace_id)
         store = store or connect_store(config.redis_url)
         created = False
         if session_id and (existing := history.load_session(session_id)):
@@ -111,11 +112,18 @@ class Runtime:
                 parent_agent_id=parent_agent_id,
             )
             history.save_session(session)
+        memory = Memory(config, session.user_id, session.workspace_id)
+        user_settings = UserSettingsStore(config).get(session.user_id)
         runtime = cls(
             config=config,
             history=history,
             memory=memory,
-            llm=LLM(config, small=depth > 0),
+            llm=LLM(
+                config,
+                small=depth > 0,
+                model_override=None if depth > 0 else user_settings.default_model,
+                reasoning_effort=user_settings.reasoning_effort,
+            ),
             context=ContextBuilder(config, history, memory),
             cwd=cwd,
             session=session,
@@ -123,6 +131,7 @@ class Runtime:
             store=store,
             hooks=hooks or default_hooks(config.hook_timeout_seconds),
             executor=executor or ToolExecutor(),
+            user_settings=user_settings,
             depth=depth,
             extra_system=extra_system,
             allowed_tools=allowed_tools,
@@ -161,6 +170,10 @@ class Runtime:
             user_text=text,
         )
         self.history.save_turn(turn)
+        if not self.session.title:
+            self.session.title = text.strip()[:72]
+        self.session.unread = False
+        self.history.save_session(self.session)
         result = self.hooks.run_before(USER_PROMPT_SUBMIT, self._hook_ctx(USER_PROMPT_SUBMIT, turn))
         if result.is_rejected:
             turn.status = TurnStatus.FAILED.value
@@ -286,7 +299,11 @@ class Runtime:
         return self._finish(turn, TurnStatus.FAILED, "max_steps_exceeded")
 
     def _call_llm(self, turn: Turn):
-        messages = self.context.messages(turn.session_id, self.extra_system)
+        messages = self.context.messages(
+            turn.session_id,
+            self.extra_system,
+            self.user_settings.soul_md,
+        )
         return self.llm.complete(
             messages,
             self.schemas(),

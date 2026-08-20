@@ -11,6 +11,7 @@ from harness.memory import Memory
 from harness.runtime import Runtime
 from harness.store import MemoryStore, is_cancelled, request_cancel
 from harness.tools import default_tools
+from harness.user_settings import UserSettingsStore
 from harness.types import Event, ModelResponse, ToolCall, TurnStatus
 
 
@@ -379,3 +380,55 @@ def test_every_tool_has_hook_lists_and_ask_user_interrupts(tmp_path, monkeypatch
     assert any(hook.name == "interrupt" for hook in tools["ask_user"].before_hooks)
     assert any(hook.name == "approval" for hook in tools["write_file"].before_hooks)
     assert any(hook.name == "approval" for hook in tools["bash"].before_hooks)
+
+
+def test_user_settings_are_separate_and_feed_runtime(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    store = UserSettingsStore(config)
+    saved = store.update(
+        "u1",
+        {
+            "default_model": "custom/model",
+            "reasoning_effort": "high",
+            "soul_md": "# SOUL.md\nAlways say lighthouse.",
+            "settings": {"theme": "light"},
+        },
+    )
+    assert saved.reasoning_effort == "high"
+    runtime = Runtime.create(config, user_id="u1", workspace_id="studio", cwd=tmp_path, store=MemoryStore())
+    assert runtime.llm.model == "custom/model"
+    assert runtime.llm.reasoning_effort == "high"
+    prompt = runtime.context.system_prompt(soul_override=runtime.user_settings.soul_md)
+    assert "Always say lighthouse" in prompt
+    assert "model" not in runtime.session.to_dict()
+    assert "soul_md" not in runtime.session.to_dict()
+
+
+def test_session_metadata_lists_workspaces_and_filters(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    history = History(config)
+    runtime = Runtime.create(config, user_id="u2", workspace_id="art", cwd=tmp_path, store=MemoryStore())
+    runtime.session.title = "Concept sketch"
+    runtime.session.starred = True
+    history.save_session(runtime.session)
+    listed = history.list_sessions("u2", "art")
+    assert listed[0].title == "Concept sketch"
+    assert listed[0].starred is True
+    assert history.list_workspaces("u2") == ["art"]
+
+
+def test_llm_payload_includes_reasoning_effort(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    from harness.llm import LLM
+
+    llm = LLM(config, model_override="custom/model", reasoning_effort="high")
+    captured = {}
+    monkeypatch.setattr(llm, "_stream", lambda body, on_delta: captured.update(body) or ModelResponse(text="ok"))
+    monkeypatch.setattr(type(llm), "api_key", property(lambda self: "key"))
+    llm.complete([{"role": "user", "content": "hi"}])
+    assert captured["model"] == "custom/model"
+    assert captured["reasoning_effort"] == "high"

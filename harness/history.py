@@ -36,11 +36,37 @@ class History:
         return [Event.from_dict(row) for row in rows]
 
     def save_session(self, session: Session) -> None:
+        session.updated_at = now_iso()
         self.db.upsert("sessions", session.to_dict(), "session_id")
 
     def load_session(self, session_id: str) -> Session | None:
         rows = self.db.select("sessions", {"select": "*", "session_id": f"eq.{session_id}", "limit": "1"})
         return Session.from_dict(rows[0]) if rows else None
+
+    def list_sessions(self, user_id: str, workspace_id: str | None = None) -> list[Session]:
+        params: dict[str, str] = {
+            "select": "*",
+            "user_id": f"eq.{user_id}",
+            "order": "updated_at.desc",
+            "limit": "200",
+        }
+        if workspace_id:
+            params["workspace_id"] = f"eq.{workspace_id}"
+        return [Session.from_dict(row) for row in self.db.select("sessions", params)]
+
+    def list_workspaces(self, user_id: str) -> list[str]:
+        rows = self.db.select(
+            "sessions",
+            {"select": "workspace_id", "user_id": f"eq.{user_id}", "limit": "500"},
+        )
+        names = []
+        seen: set[str] = set()
+        for row in rows:
+            name = str(row.get("workspace_id") or "default")
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names or ["default"]
 
     def save_turn(self, turn: Turn) -> None:
         turn.updated_at = now_iso()

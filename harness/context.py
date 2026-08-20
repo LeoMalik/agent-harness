@@ -29,9 +29,9 @@ class ContextBuilder:
         self.memory = memory
         self._compact_hold_chars: int | None = None
 
-    def system_prompt(self, extra: str = "") -> str:
+    def system_prompt(self, extra: str = "", soul_override: str | None = None) -> str:
         agents = _read(self.config.prompts_dir / "AGENTS.md")
-        soul = _read(self.config.prompts_dir / "SOUL.md")
+        soul = soul_override.strip() if soul_override and soul_override.strip() else _read(self.config.prompts_dir / "SOUL.md")
         graphs = self._graph_catalog()
         skills = self._skill_catalog()
         body = "\n\n".join(
@@ -52,10 +52,17 @@ class ContextBuilder:
         )
         return wrap_system(body)
 
-    def messages(self, session_id: str, extra_system: str = "") -> list[dict[str, Any]]:
+    def messages(
+        self,
+        session_id: str,
+        extra_system: str = "",
+        soul_override: str | None = None,
+    ) -> list[dict[str, Any]]:
         events = self.history.events(session_id)
         start = self._checkpoint_start(events)
-        messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt(extra_system)}]
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt(extra_system, soul_override)}
+        ]
         for event in events[start:]:
             converted = self._event_message(event)
             if converted:

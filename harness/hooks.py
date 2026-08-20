@@ -386,29 +386,38 @@ def _metrics_llm(ctx: HookContext) -> None:
     if ctx.turn is None:
         return
     usage = ctx.extra.get("usage") or {}
-    ctx.runtime.publisher(
-        ctx.turn.turn_id,
-        "metrics.llm",
-        {
-            "model_id": ctx.runtime.llm.model,
-            "input_tokens": usage.get("input_tokens") or 0,
-            "output_tokens": usage.get("output_tokens") or 0,
-        },
+    payload = {
+        "model_id": ctx.runtime.llm.model,
+        "reasoning_effort": ctx.runtime.user_settings.reasoning_effort,
+        "input_tokens": usage.get("input_tokens") or 0,
+        "output_tokens": usage.get("output_tokens") or 0,
+    }
+    ctx.runtime.history.emit(
+        "metrics_llm",
+        session_id=ctx.turn.session_id,
+        turn_id=ctx.turn.turn_id,
+        agent_id=ctx.turn.agent_id,
+        **payload,
     )
+    ctx.runtime.publisher(ctx.turn.turn_id, "metrics.llm", payload)
 
 
 def _metrics_tool(ctx: HookContext) -> None:
     if ctx.turn is None or ctx.call is None or ctx.observation is None:
         return
-    ctx.runtime.publisher(
-        ctx.turn.turn_id,
-        "metrics.tool",
-        {
-            "tool_call_id": ctx.call.tool_call_id,
-            "tool_name": ctx.call.name,
-            "status": ctx.observation.outcome,
-        },
+    payload = {
+        "tool_call_id": ctx.call.tool_call_id,
+        "tool_name": ctx.call.name,
+        "status": ctx.observation.outcome,
+    }
+    ctx.runtime.history.emit(
+        "metrics_tool",
+        session_id=ctx.turn.session_id,
+        turn_id=ctx.turn.turn_id,
+        agent_id=ctx.turn.agent_id,
+        **payload,
     )
+    ctx.runtime.publisher(ctx.turn.turn_id, "metrics.tool", payload)
 
 
 def _persist_memory(ctx: HookContext) -> None:
