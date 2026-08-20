@@ -217,6 +217,23 @@ def test_should_compact_ignores_pre_checkpoint_events(tmp_path, monkeypatch):
     assert builder2.should_compact("s2") is True
 
 
+def test_skill_catalog_prefers_frontmatter_description(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    (tmp_path / "skills").mkdir(exist_ok=True)
+    (tmp_path / "skills" / "find-skills").mkdir(exist_ok=True)
+    (tmp_path / "skills" / "find-skills" / "SKILL.md").write_text(
+        "---\nname: find-skills\ndescription: Discover and install agent skills.\n---\n\n# Find Skills\n",
+        encoding="utf-8",
+    )
+    history = History(config)
+    builder = ContextBuilder(config, history, Memory(config, "u", "w"))
+    catalog = builder._skill_catalog()
+    assert "find-skills (built-in): Discover and install agent skills." in catalog
+    assert "---" not in catalog
+
+
 def test_write_file_tool(tmp_path, monkeypatch):
     db = FakeDB()
     config = make_config(tmp_path)

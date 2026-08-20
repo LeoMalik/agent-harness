@@ -153,14 +153,31 @@ class ContextBuilder:
             }
         return None
 
+    def _skill_summary(self, skill_md: Path) -> str:
+        text = skill_md.read_text(encoding="utf-8").strip()
+        # skills.sh 生态使用 YAML frontmatter；优先取 description，避免目录项显示成 "---"
+        if text.startswith("---"):
+            in_frontmatter = False
+            for line in text.splitlines():
+                if line.strip() == "---":
+                    if not in_frontmatter:
+                        in_frontmatter = True
+                        continue
+                    break
+                if in_frontmatter and line.startswith("description:"):
+                    desc = line.split(":", 1)[1].strip()
+                    if desc:
+                        return desc
+        first = next((line.strip("# ").strip() for line in text.splitlines() if line.strip()), "")
+        return first or skill_md.parent.name
+
     def _skill_catalog(self) -> str:
         lines = []
         # 出厂（built-in）skill：随代码分发，读本地部署包
         root = self.config.skills_dir
         if root.exists():
             for skill_md in sorted(root.glob("*/SKILL.md")):
-                first = next((line.strip("# ").strip() for line in skill_md.read_text(encoding="utf-8").splitlines() if line.strip()), skill_md.parent.name)
-                lines.append(f"- {skill_md.parent.name} (built-in): {first}")
+                lines.append(f"- {skill_md.parent.name} (built-in): {self._skill_summary(skill_md)}")
         # 用户（user）skill：云存储，按 user 隔离
         db = self.config.db()
         if db is not None:
