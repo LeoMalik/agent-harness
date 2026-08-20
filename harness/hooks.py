@@ -14,12 +14,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import TYPE_CHECKING, Any, Callable
 
 from harness.billing import debit_turn, ensure_balance
+from harness.llm import LLM
 from harness.store import is_cancelled, resources_key
 from harness.types import Observation, ToolCall, Turn, WaitingFor, new_id
 
@@ -154,6 +156,13 @@ class HookBus:
         ctx.event = event
         self.run_after_list(self._hooks.get(event, []), ctx)
 
+    def dispatch_async(self, event: str, ctx: HookContext) -> None:
+        """Start only non-blocking hooks registered for this lifecycle event."""
+        ctx.event = event
+        for hook in self._hooks.get(event, []):
+            if not hook.sync:
+                self._spawn_async(hook, ctx)
+
     def run_before_list(self, hooks: list[Hook], ctx: HookContext) -> HookResult:
         result = HookResult.ok()
         for hook in hooks:
@@ -204,6 +213,7 @@ def session_hooks() -> list[Hook]:
     return [
         Hook("ensure_balance", (SESSION_START,), _ensure_balance_hook),
         Hook("balance", (USER_PROMPT_SUBMIT,), _balance_hook),
+        Hook("session_title", (USER_PROMPT_SUBMIT,), _session_title_hook, sync=False),
         Hook("cancel", (BEFORE_LLM_CALL, BEFORE_TOOL), _cancel_hook),
         Hook("schema", (BEFORE_TOOL,), _schema_hook),
         Hook("metrics_llm", (AFTER_LLM_CALL,), _metrics_llm, sync=False),
@@ -251,6 +261,69 @@ def _balance_hook(ctx: HookContext) -> HookResult | None:
     if not ok:
         return HookResult.reject(f"insufficient_balance:{remaining}")
     return None
+
+
+def _session_title_hook(ctx: HookContext) -> None:
+    if ctx.turn is None or ctx.runtime.session.title:
+        return
+    user_text = str(ctx.extra.get("user_text") or "").strip()
+    if not user_text:
+        return
+    user_messages = [
+        event for event in ctx.runtime.history.events(ctx.runtime.session.session_id)
+        if event.type == "user_message"
+    ]
+    if len(user_messages) != 1:
+        return
+    if not ctx.runtime.config.small_api_key:
+        return
+    title_llm = LLM(ctx.runtime.config, small=True, reasoning_effort="low")
+    response = title_llm.complete(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "Create a very short title for the user's task. Follow the user's language. "
+                    "Chinese: at most 12 characters. English: at most 8 words. "
+                    "Return one plain-text line only. No Markdown, quotes, labels, or trailing punctuation. "
+                    "Describe the task; do not answer it."
+                ),
+            },
+            {"role": "user", "content": user_text},
+        ],
+        tools=None,
+        temperature=0.1,
+    )
+    title = sanitize_session_title(response.text, user_text)
+    if not title:
+        return
+    current = ctx.runtime.history.load_session(ctx.runtime.session.session_id)
+    if current is None or current.title:
+        return
+    current.title = title
+    ctx.runtime.history.save_session(current)
+    ctx.runtime.session.title = title
+    ctx.runtime.publisher(
+        ctx.turn.turn_id,
+        "session.title_updated",
+        {"session_id": current.session_id, "title": title, "model": title_llm.model},
+    )
+
+
+def sanitize_session_title(raw: str, user_text: str) -> str:
+    title = str(raw or "").splitlines()[0].strip()
+    title = re.sub(r"^\s*(?:title|标题)\s*[:：-]\s*", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^#{1,6}\s*", "", title)
+    title = title.replace("`", "").replace("**", "").replace("__", "")
+    title = title.strip(" \t\"'“”‘’《》【】[]()")
+    title = re.sub(r"[。！？!?；;：:，,、.]+$", "", title).strip()
+    if not title:
+        return ""
+    if re.search(r"[\u3400-\u9fff]", user_text):
+        title = re.sub(r"\s+", "", title)
+        return title[:12].rstrip("。！？!?；;：:，,、.")
+    words = title.split()
+    return " ".join(words[:8]).rstrip(".?!,;:")
 
 
 def _cancel_hook(ctx: HookContext) -> HookResult | None:

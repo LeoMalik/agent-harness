@@ -170,8 +170,6 @@ class Runtime:
             user_text=text,
         )
         self.history.save_turn(turn)
-        if not self.session.title:
-            self.session.title = text.strip()[:72]
         self.session.unread = False
         self.history.save_session(self.session)
         result = self.hooks.run_before(USER_PROMPT_SUBMIT, self._hook_ctx(USER_PROMPT_SUBMIT, turn))
@@ -188,6 +186,10 @@ class Runtime:
             text=text,
         )
         self.publisher(turn.turn_id, "turn.started", {"session_id": turn.session_id, "text": text})
+        self.hooks.dispatch_async(
+            USER_PROMPT_SUBMIT,
+            self._hook_ctx(USER_PROMPT_SUBMIT, turn, extra={"user_text": text}),
+        )
         return turn
 
     def resume(self, session_id: str, answer: str) -> Turn:

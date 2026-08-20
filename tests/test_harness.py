@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event as ThreadEvent
 
 import pytest
 
 from harness.config import Config
 from harness.context import ContextBuilder, USER_TAG
+from harness.hooks import HookContext, _session_title_hook, sanitize_session_title
 from harness.history import History
 from harness.memory import Memory
 from harness.runtime import Runtime
@@ -432,3 +434,109 @@ def test_llm_payload_includes_reasoning_effort(tmp_path, monkeypatch):
     llm.complete([{"role": "user", "content": "hi"}])
     assert captured["model"] == "custom/model"
     assert captured["reasoning_effort"] == "high"
+
+
+def test_title_sanitizer_enforces_concise_contract():
+    chinese = sanitize_session_title('标题：**讨论新的绘画工作区设计方案。**', '请设计一个新的绘画工作区')
+    assert chinese == '讨论新的绘画工作区设计方'
+    assert len(chinese) <= 12
+    english = sanitize_session_title('Title: "Design a better workspace conversation sidebar today."', 'Design a better sidebar')
+    assert english == 'Design a better workspace conversation sidebar today'
+    assert len(english.split()) <= 8
+
+
+def test_session_title_generation_does_not_block_main_answer(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = Config(
+        root=tmp_path,
+        prompts_dir=tmp_path / "prompts",
+        skills_dir=tmp_path / "skills",
+        graphs_dir=tmp_path / "graphs",
+        small_api_key="test-key",
+    )
+    (tmp_path / "prompts").mkdir(exist_ok=True)
+    (tmp_path / "prompts" / "AGENTS.md").write_text("Follow the user.", encoding="utf-8")
+    (tmp_path / "prompts" / "SOUL.md").write_text("Be brief.", encoding="utf-8")
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    from harness import hooks as hooks_module
+
+    title_started = ThreadEvent()
+    release_title = ThreadEvent()
+
+    class BlockingTitleLLM:
+        model = "small-title-model"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def complete(self, *args, **kwargs):
+            title_started.set()
+            release_title.wait(timeout=2)
+            return ModelResponse(text="Async title")
+
+    monkeypatch.setattr(hooks_module, "LLM", BlockingTitleLLM)
+    runtime = Runtime.create(config, user_id="u-async", cwd=tmp_path, store=MemoryStore())
+    runtime.llm = FakeLLM([ModelResponse(text="main answer")])
+    turn = runtime.run("Please answer while naming this chat")
+    assert title_started.wait(timeout=1)
+    assert turn.status == TurnStatus.COMPLETED.value
+    assert turn.final_text == "main answer"
+    assert runtime.history.load_session(runtime.session.session_id).title == ""
+    release_title.set()
+    for _ in range(100):
+        if runtime.history.load_session(runtime.session.session_id).title:
+            break
+        ThreadEvent().wait(0.01)
+    assert runtime.history.load_session(runtime.session.session_id).title == "Async title"
+
+
+def test_session_title_hook_updates_only_first_untitled_session(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    runtime = Runtime.create(config, user_id="u-title", cwd=tmp_path, store=MemoryStore())
+    turn = runtime.start_turn("请帮我规划绘画工作区")
+    from harness import hooks as hooks_module
+
+    class TitleLLM:
+        model = "small-title-model"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def complete(self, *args, **kwargs):
+            return ModelResponse(text="绘画工作区规划。")
+
+    monkeypatch.setattr(hooks_module, "LLM", TitleLLM)
+    _session_title_hook(HookContext("user_prompt_submit", runtime, turn, extra={"user_text": turn.user_text}))
+    saved = runtime.history.load_session(runtime.session.session_id)
+    assert saved.title == "绘画工作区规划"
+    events = runtime.store.xrange(f"turn:{turn.turn_id}:events")
+    assert any(fields.get("type") == "session.title_updated" for _, fields in events)
+    _session_title_hook(HookContext("user_prompt_submit", runtime, turn, extra={"user_text": "第二条"}))
+    assert runtime.history.load_session(runtime.session.session_id).title == "绘画工作区规划"
+
+
+def test_session_title_failure_does_not_fail_turn(tmp_path, monkeypatch):
+    db = FakeDB()
+    runtime = make_runtime(tmp_path, [ModelResponse(text="main answer")], monkeypatch, db=db)
+    from harness import hooks as hooks_module
+
+    class BrokenTitleLLM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def complete(self, *args, **kwargs):
+            raise RuntimeError("title unavailable")
+
+    monkeypatch.setattr(hooks_module, "LLM", BrokenTitleLLM)
+    runtime.config = Config(
+        root=runtime.config.root,
+        prompts_dir=runtime.config.prompts_dir,
+        skills_dir=runtime.config.skills_dir,
+        graphs_dir=runtime.config.graphs_dir,
+        small_api_key="test-key",
+    )
+    turn = runtime.run("answer normally")
+    assert turn.status == TurnStatus.COMPLETED.value
+    assert turn.final_text == "main answer"

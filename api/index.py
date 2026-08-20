@@ -49,7 +49,7 @@ def _session_payload(session) -> dict:
     return {
         "session_id": session.session_id,
         "workspace_id": session.workspace_id,
-        "title": session.title or "Untitled",
+        "title": session.title or "",
         "starred": session.starred,
         "archived": session.archived,
         "trashed": session.trashed,
