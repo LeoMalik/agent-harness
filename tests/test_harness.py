@@ -103,6 +103,7 @@ def make_config(tmp_path: Path) -> Config:
         prompts_dir=tmp_path / "prompts",
         skills_dir=tmp_path / "skills",
         graphs_dir=tmp_path / "graphs",
+        small_api_key="",
     )
     (tmp_path / "prompts").mkdir(exist_ok=True)
     (tmp_path / "prompts" / "AGENTS.md").write_text("Follow the user.", encoding="utf-8")
@@ -316,9 +317,11 @@ def test_memory_replace_active_retires_and_updates(tmp_path, monkeypatch):
 
 
 def test_persist_memory_extracts_facts(tmp_path, monkeypatch):
+    from dataclasses import replace
     from harness import hooks as hooks_module
 
     runtime = make_runtime(tmp_path, [ModelResponse(text="x")], monkeypatch)
+    runtime.config = replace(runtime.config, small_api_key="test-key")
 
     class FakeMemoryLLM:
         def __init__(self, *args, **kwargs):
@@ -345,7 +348,7 @@ def test_reflect_memory_fires_every_n_turns(tmp_path, monkeypatch):
     from harness import hooks as hooks_module
 
     runtime = make_runtime(tmp_path, [ModelResponse(text="x")], monkeypatch)
-    runtime.config = replace(runtime.config, reflect_interval=2)
+    runtime.config = replace(runtime.config, reflect_interval=2, small_api_key="test-key")
 
     class FakeReflectLLM:
         def __init__(self, *args, **kwargs):
@@ -674,6 +677,8 @@ def test_session_title_generation_does_not_block_main_answer(tmp_path, monkeypat
             return ModelResponse(text="Async title")
 
     monkeypatch.setattr(hooks_module, "LLM", BlockingTitleLLM)
+    monkeypatch.setattr(hooks_module, "_persist_memory", lambda ctx: None)
+    monkeypatch.setattr(hooks_module, "_reflect_memory", lambda ctx: None)
     runtime = Runtime.create(config, user_id="u-async", cwd=tmp_path, store=MemoryStore())
     runtime.llm = FakeLLM([ModelResponse(text="main answer")])
     turn = runtime.run("Please answer while naming this chat")
@@ -690,8 +695,10 @@ def test_session_title_generation_does_not_block_main_answer(tmp_path, monkeypat
 
 
 def test_session_title_hook_updates_only_first_untitled_session(tmp_path, monkeypatch):
+    from dataclasses import replace
+
     db = FakeDB()
-    config = make_config(tmp_path)
+    config = replace(make_config(tmp_path), small_api_key="test-key")
     monkeypatch.setattr(Config, "db", lambda self: db)
     runtime = Runtime.create(config, user_id="u-title", cwd=tmp_path, store=MemoryStore())
     turn = runtime.start_turn("请帮我规划绘画工作区")

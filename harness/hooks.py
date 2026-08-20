@@ -218,8 +218,11 @@ def session_hooks() -> list[Hook]:
         Hook("schema", (BEFORE_TOOL,), _schema_hook),
         Hook("metrics_llm", (AFTER_LLM_CALL,), _metrics_llm, sync=False),
         Hook("metrics_tool", (AFTER_TOOL_CALL,), _metrics_tool, sync=False),
-        Hook("persist_memory", (AFTER_TURN,), _persist_memory, sync=False),
-        Hook("reflect_memory", (AFTER_TURN,), _reflect_memory, sync=False),
+        # 记忆写回默认同步：Vercel serverless 返回后会被冻结，异步线程可能跑不完。
+        # 答案与 turn.completed 已先发布，同步仅让 HTTP 确认晚 ~1-2s。
+        # 自建常驻进程可改回 sync=False 做纯异步写回（不阻塞返回）。
+        Hook("persist_memory", (AFTER_TURN,), _persist_memory, sync=True),
+        Hook("reflect_memory", (AFTER_TURN,), _reflect_memory, sync=True),
         Hook("metrics_turn", (AFTER_TURN,), _metrics_turn, sync=False),
     ]
 
