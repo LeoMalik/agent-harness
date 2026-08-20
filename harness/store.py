@@ -7,6 +7,7 @@ from typing import Any, Protocol
 class Store(Protocol):
     def get(self, key: str) -> str | None: ...
     def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool: ...
+    def incr(self, key: str) -> int: ...
     def delete(self, key: str) -> None: ...
     def sadd(self, key: str, member: str) -> None: ...
     def smembers(self, key: str) -> set[str]: ...
@@ -30,6 +31,11 @@ class MemoryStore:
             return False
         self.kv[key] = value
         return True
+
+    def incr(self, key: str) -> int:
+        value = int(self.kv.get(key) or 0) + 1
+        self.kv[key] = str(value)
+        return value
 
     def delete(self, key: str) -> None:
         self.kv.pop(key, None)
@@ -73,6 +79,9 @@ class RedisStore:
     def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool:
         result = self.client.set(key, value, nx=nx, ex=ex)
         return bool(result)
+
+    def incr(self, key: str) -> int:
+        return int(self.client.incr(key))
 
     def delete(self, key: str) -> None:
         self.client.delete(key)

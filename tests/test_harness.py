@@ -14,7 +14,7 @@ from harness.runtime import Runtime
 from harness.store import MemoryStore, is_cancelled, request_cancel
 from harness.tools import default_tools
 from harness.user_settings import UserSettingsStore
-from harness.types import Event, ModelResponse, ToolCall, TurnStatus
+from harness.types import Event, ModelResponse, ToolCall, Turn, TurnStatus
 
 
 class FakeLLM:
@@ -292,6 +292,80 @@ def test_handle_tools_persists_thinking(tmp_path, monkeypatch):
     tool_calls = [e for e in runtime.history.events(turn.session_id) if e.type == "tool_call"]
     assert tool_calls
     assert tool_calls[0].payload.get("thinking") == "think step"
+
+
+def test_parse_json_array_handles_fences_and_prose():
+    from harness import hooks as hooks_module
+
+    assert hooks_module._parse_json_array('```json\n[{"slot":"a","text":"b"}]\n```') == [{"slot": "a", "text": "b"}]
+    assert hooks_module._parse_json_array('prose [{"slot":"a","text":"b"}] tail') == [{"slot": "a", "text": "b"}]
+    assert hooks_module._parse_json_array("no array here") == []
+    assert hooks_module._parse_json_array('[1, 2, "x"]') == []
+
+
+def test_memory_replace_active_retires_and_updates(tmp_path, monkeypatch):
+    db = FakeDB()
+    config = make_config(tmp_path)
+    monkeypatch.setattr(Config, "db", lambda self: db)
+    memory = Memory(config, "u", "w")
+    memory.upsert("profile.a", "old-a", "profile", "t1", "s1")
+    memory.upsert("profile.b", "old-b", "profile", "t1", "s1")
+    memory.replace_active([{"slot": "profile.a", "text": "new-a", "layer": "profile"}], "t2", "s2")
+    assert {f.slot: f.text for f in memory.active()} == {"profile.a": "new-a"}
+    assert any(f.slot == "profile.b" and f.status == "retired" for f in memory.load())
+
+
+def test_persist_memory_extracts_facts(tmp_path, monkeypatch):
+    from harness import hooks as hooks_module
+
+    runtime = make_runtime(tmp_path, [ModelResponse(text="x")], monkeypatch)
+
+    class FakeMemoryLLM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def complete(self, messages, tools=None, temperature=0.2, on_delta=None):
+            return ModelResponse(text='[{"slot":"profile.location.city","text":"杭州","layer":"profile"}]')
+
+    monkeypatch.setattr(hooks_module, "LLM", FakeMemoryLLM)
+    turn = Turn(
+        turn_id="turn_mem",
+        session_id=runtime.session.session_id,
+        agent_id="a",
+        user_text="我住在杭州",
+        final_text="好的",
+    )
+    hooks_module._persist_memory(HookContext(event="after_turn", runtime=runtime, turn=turn))
+    facts = runtime.memory.active()
+    assert any(f.slot == "profile.location.city" and f.text == "杭州" for f in facts)
+
+
+def test_reflect_memory_fires_every_n_turns(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from harness import hooks as hooks_module
+
+    runtime = make_runtime(tmp_path, [ModelResponse(text="x")], monkeypatch)
+    runtime.config = replace(runtime.config, reflect_interval=2)
+
+    class FakeReflectLLM:
+        def __init__(self, *args, **kwargs):
+            self.calls = 0
+
+        def complete(self, messages, tools=None, temperature=0.2, on_delta=None):
+            self.calls += 1
+            return ModelResponse(text='[{"slot":"profile.a","text":"merged","layer":"profile"}]')
+
+    fake = FakeReflectLLM()
+    monkeypatch.setattr(hooks_module, "LLM", lambda *a, **k: fake)
+    runtime.memory.upsert("profile.a", "old", "profile", "t0", "s0")
+    turn = Turn(turn_id="turn_ref", session_id=runtime.session.session_id, agent_id="a")
+    ctx = HookContext(event="after_turn", runtime=runtime, turn=turn)
+
+    hooks_module._reflect_memory(ctx)  # count = 1
+    assert fake.calls == 0
+    hooks_module._reflect_memory(ctx)  # count = 2 → reflect
+    assert fake.calls == 1
+    assert any(f.slot == "profile.a" and f.text == "merged" for f in runtime.memory.active())
 
 
 def test_write_file_tool(tmp_path, monkeypatch):

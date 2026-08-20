@@ -219,6 +219,7 @@ def session_hooks() -> list[Hook]:
         Hook("metrics_llm", (AFTER_LLM_CALL,), _metrics_llm, sync=False),
         Hook("metrics_tool", (AFTER_TOOL_CALL,), _metrics_tool, sync=False),
         Hook("persist_memory", (AFTER_TURN,), _persist_memory, sync=False),
+        Hook("reflect_memory", (AFTER_TURN,), _reflect_memory, sync=False),
         Hook("metrics_turn", (AFTER_TURN,), _metrics_turn, sync=False),
     ]
 
@@ -493,10 +494,131 @@ def _metrics_tool(ctx: HookContext) -> None:
     ctx.runtime.publisher(ctx.turn.turn_id, "metrics.tool", payload)
 
 
+_MEMORY_EXTRACT_PROMPT = (
+    "Extract stable, durable facts about the user from this conversation turn. "
+    "Only include long-term personal facts, preferences, or stable context "
+    "(for example: name, location, job, relationships, tastes, goals). "
+    "Ignore transient task details, questions, and the assistant's answer to a single request. "
+    'Return a JSON array where each item is {"slot": "stable.key.path", "text": "fact", "layer": "profile"}. '
+    '"profile" means the fact is needed almost every turn. '
+    "If nothing durable is present, return an empty array []. "
+    "Return ONLY the JSON array, no prose, no Markdown fences."
+)
+
+_MEMORY_REFLECT_PROMPT = (
+    "You are consolidating a personal memory store. "
+    'Given the current active facts as a JSON array of {"slot","text","layer"}, '
+    "return the consolidated final list: merge duplicate or overlapping facts into one, "
+    "fix contradictions by keeping the most recent or most specific, retire obsolete facts by omitting them, "
+    "and keep everything else unchanged. "
+    'Return ONLY a JSON array of {"slot","text","layer"}, no prose, no Markdown fences.'
+)
+
+
+def _reflect_key(user_id: str, workspace_id: str) -> str:
+    return f"memory:turn_count:{user_id}:{workspace_id}"
+
+
+def _turn_text_for_memory(runtime: Runtime, turn: Turn) -> str:
+    parts: list[str] = []
+    if turn.user_text:
+        parts.append(f"User: {turn.user_text}")
+    if turn.final_text:
+        parts.append(f"Assistant: {turn.final_text}")
+    return "\n".join(parts)
+
+
+def _parse_json_array(raw: str) -> list[dict[str, Any]]:
+    text = str(raw or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return []
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
 def _persist_memory(ctx: HookContext) -> None:
-    records = ctx.runtime.memory.active()
-    if records:
-        ctx.runtime.memory.save(records)
+    """语义记忆写回：从本轮抽取稳定事实，异步、可失败、不阻塞主返回。"""
+    turn = ctx.turn
+    if turn is None:
+        return
+    runtime = ctx.runtime
+    if not runtime.config.small_api_key:
+        return
+    text = _turn_text_for_memory(runtime, turn)
+    if not text.strip():
+        return
+    try:
+        llm = LLM(runtime.config, small=True, reasoning_effort="low")
+        response = llm.complete(
+            [
+                {"role": "system", "content": _MEMORY_EXTRACT_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            tools=None,
+            temperature=0.0,
+        )
+        for fact in _parse_json_array(response.text):
+            slot = str(fact.get("slot") or "").strip()
+            value = str(fact.get("text") or "").strip()
+            layer = str(fact.get("layer") or "profile").strip() or "profile"
+            if layer not in {"profile", "rag"}:
+                layer = "profile"
+            if not slot or not value:
+                continue
+            runtime.memory.upsert(slot, value, layer, turn.turn_id, turn.session_id)
+    except Exception:  # noqa: BLE001 - 记忆写回失败绝不能让 turn 失败
+        log.exception("memory extraction failed for turn %s", turn.turn_id)
+
+
+def _reflect_memory(ctx: HookContext) -> None:
+    """滑动窗口 Reflect：每 N 轮对 active 记忆做合并/去重/修正/retire。"""
+    turn = ctx.turn
+    if turn is None:
+        return
+    runtime = ctx.runtime
+    interval = runtime.config.reflect_interval
+    if interval <= 0 or not runtime.config.small_api_key:
+        return
+    key = _reflect_key(runtime.memory.user_id, runtime.memory.workspace_id)
+    try:
+        count = runtime.store.incr(key)
+    except Exception:  # noqa: BLE001
+        return
+    if count % interval != 0:
+        return
+    records = runtime.memory.active()
+    if not records:
+        return
+    try:
+        llm = LLM(runtime.config, small=True, reasoning_effort="low")
+        response = llm.complete(
+            [
+                {"role": "system", "content": _MEMORY_REFLECT_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        [{"slot": r.slot, "text": r.text, "layer": r.layer} for r in records],
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            tools=None,
+            temperature=0.0,
+        )
+        facts = _parse_json_array(response.text)
+        if facts:
+            runtime.memory.replace_active(facts, turn.turn_id, turn.session_id)
+    except Exception:  # noqa: BLE001 - Reflect 失败下个窗口再试
+        log.exception("memory reflection failed for %s", key)
 
 
 def _metrics_turn(ctx: HookContext) -> None:

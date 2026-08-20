@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from harness.config import Config
 from harness.types import SemanticRecord, new_id, now_iso
 
@@ -68,3 +70,53 @@ class Memory:
         records.append(record)
         self.save(records)
         return record
+
+    def replace_active(
+        self,
+        facts: list[dict[str, Any]],
+        source_turn_id: str,
+        source_session_id: str,
+    ) -> None:
+        """用 Reflect 后的最终 active 集合替换现有 active 记忆。
+
+        返回集里存在的 slot 保留/更新；不在返回集里的 active 记录被 retire。
+        """
+        records = self.load()
+        now = now_iso()
+        final_slots = {
+            str(fact.get("slot") or "").strip()
+            for fact in facts
+            if str(fact.get("slot") or "").strip()
+        }
+        for item in records:
+            if item.status == "active" and item.slot not in final_slots:
+                item.status = "retired"
+                item.retired_at = now
+                item.updated_at = now
+        active_by_slot = {item.slot: item for item in records if item.status == "active"}
+        for fact in facts:
+            slot = str(fact.get("slot") or "").strip()
+            text = str(fact.get("text") or "").strip()
+            layer = str(fact.get("layer") or "profile").strip() or "profile"
+            if layer not in {"profile", "rag"}:
+                layer = "profile"
+            if not slot or not text:
+                continue
+            existing = active_by_slot.get(slot)
+            if existing is not None:
+                existing.text = text
+                existing.layer = layer
+                existing.updated_at = now
+            else:
+                records.append(
+                    SemanticRecord(
+                        id=new_id("mem"),
+                        slot=slot,
+                        text=text,
+                        layer=layer,
+                        status="active",
+                        source_turn_id=source_turn_id,
+                        source_session_id=source_session_id,
+                    )
+                )
+        self.save(records)

@@ -33,6 +33,7 @@ class Config:
     max_tool_retries: int = int(os.getenv("HARNESS_MAX_TOOL_RETRIES", "0"))
     hook_timeout_seconds: int = int(os.getenv("HARNESS_HOOK_TIMEOUT", "30"))
     compact_chars: int = int(os.getenv("HARNESS_COMPACT_CHARS", "500_000"))
+    reflect_interval: int = int(os.getenv("HARNESS_REFLECT_INTERVAL", "5"))
     max_inline_chars: int = 8_000
     tool_timeout: int = 30
     artifact_range_bytes: int = 64 * 1024
