@@ -16,7 +16,7 @@ class Config:
     prompts_dir: Path = ROOT / "prompts"
     skills_dir: Path = ROOT / "skills"
     graphs_dir: Path = ROOT / "graphs"
-    model: str = os.getenv("HARNESS_MODEL", "xai/grok-4.5")
+    model: str = os.getenv("HARNESS_MODEL", "grok-4.5")
     small_model: str = os.getenv("HARNESS_SMALL_MODEL", "deepseek-v4-flash")
     base_url: str = os.getenv("HARNESS_BASE_URL", "https://sub2api-production-3d63.up.railway.app/v1")
     api_key: str = os.getenv("HARNESS_API_KEY", "")
